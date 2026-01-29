@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -266,6 +267,7 @@ func main() {
 		deep      = flag.Bool("deep", true, "If true (default), upload files from nested subfolders under each album folder")
 		checksum  = flag.Bool("checksum", false, "If true, compute sha1 checksum and send x-immich-checksum header (slower)")
 		batchSize = flag.Int("batch", 200, "How many uploaded assets to add to album per request")
+		workers   = flag.Int("workers", 4, "Number of parallel upload workers per album")
 		timeout   = flag.Duration("timeout", 5*time.Minute, "HTTP timeout")
 		ignoreDir = flag.String("ignore-dir", "ignore", "Folder name to ignore (and destination for moved folders)")
 	)
@@ -365,44 +367,99 @@ func main() {
 		uploadedBytes := int64(0)
 		fmt.Printf("Uploading %d files (%s) from %s...\n", len(files), formatBytes(totalBytes), folderName)
 		var uploadedIDs []string
-		for i, fp := range files {
-			st, err := os.Stat(fp)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "stat %s: %v\n", fp, err)
-				continue
-			}
+		uploadErrors := 0
 
-			// deviceAssetId should be stable per file
-			rel, _ := filepath.Rel(*root, fp)
-			deviceAssetID := sha1HexString(rel)
+		type uploadJob struct {
+			idx  int
+			path string
+			size int64
+		}
+		type uploadResult struct {
+			idx   int
+			path  string
+			size  int64
+			asset assetUploadResponse
+			dur   time.Duration
+			err   error
+		}
 
-			created := st.ModTime()
-			modified := st.ModTime()
+		jobs := make(chan uploadJob)
+		results := make(chan uploadResult)
+		wg := sync.WaitGroup{}
 
-			var sum string
-			if *checksum {
-				s, err := sha1File(fp)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "checksum %s: %v\n", fp, err)
-				} else {
-					sum = s
+		workerCount := *workers
+		if workerCount < 1 {
+			workerCount = 1
+		}
+		if workerCount > len(files) {
+			workerCount = len(files)
+		}
+
+		for w := 0; w < workerCount; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for job := range jobs {
+					st, err := os.Stat(job.path)
+					if err != nil {
+						results <- uploadResult{idx: job.idx, path: job.path, size: job.size, err: err}
+						continue
+					}
+
+					rel, _ := filepath.Rel(*root, job.path)
+					deviceAssetID := sha1HexString(rel)
+					created := st.ModTime()
+					modified := st.ModTime()
+
+					var sum string
+					if *checksum {
+						s, err := sha1File(job.path)
+						if err == nil {
+							sum = s
+						}
+					}
+
+					fileStart := time.Now()
+					asset, err := c.uploadAsset(ctx, job.path, deviceID, deviceAssetID, created, modified, sum)
+					fileDur := time.Since(fileStart)
+					results <- uploadResult{idx: job.idx, path: job.path, size: job.size, asset: asset, dur: fileDur, err: err}
 				}
-			}
+			}()
+		}
 
-			fileStart := time.Now()
-			resp, err := c.uploadAsset(ctx, fp, deviceID, deviceAssetID, created, modified, sum)
-			fileDur := time.Since(fileStart)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "upload failed (%s): %v\n", fp, err)
+		go func() {
+			for i, fp := range files {
+				st, err := os.Stat(fp)
+				if err != nil {
+					// still send as error result
+					results <- uploadResult{idx: i, path: fp, size: 0, err: err}
+					continue
+				}
+				jobs <- uploadJob{idx: i, path: fp, size: st.Size()}
+			}
+			close(jobs)
+			wg.Wait()
+			close(results)
+		}()
+
+		// collect results
+		completed := 0
+		uploadedBytesMu := sync.Mutex{}
+		for res := range results {
+			completed++
+			if res.err != nil {
+				uploadErrors++
+				fmt.Fprintf(os.Stderr, "upload failed (%s): %v\n", res.path, res.err)
 				continue
 			}
-			uploadedIDs = append(uploadedIDs, resp.ID)
-			uploadedBytes += st.Size()
+			uploadedIDs = append(uploadedIDs, res.asset.ID)
+			uploadedBytesMu.Lock()
+			uploadedBytes += res.size
 			elapsed := time.Since(albumStart)
-			// progress line
 			fmt.Printf("    Progress: %d/%d (%s/%s) | avg %s | last %s (%s)\n",
-				i+1, len(files), formatBytes(uploadedBytes), formatBytes(totalBytes), formatRate(uploadedBytes, elapsed), formatRate(st.Size(), fileDur), fileDur.Round(time.Millisecond))
-			fmt.Printf("  [%d/%d] %s -> %s (%s)\n", i+1, len(files), filepath.Base(fp), resp.ID, resp.Status)
+				completed, len(files), formatBytes(uploadedBytes), formatBytes(totalBytes), formatRate(uploadedBytes, elapsed), formatRate(res.size, res.dur), res.dur.Round(time.Millisecond))
+			fmt.Printf("  [%d/%d] %s -> %s (%s)\n", completed, len(files), filepath.Base(res.path), res.asset.ID, res.asset.Status)
+			uploadedBytesMu.Unlock()
 		}
 
 		if len(uploadedIDs) == 0 {
@@ -410,7 +467,7 @@ func main() {
 			continue
 		}
 
-		albumSuccess := true
+		albumSuccess := uploadErrors == 0
 
 		// Add to album in batches
 		for _, ch := range chunk(uploadedIDs, *batchSize) {
