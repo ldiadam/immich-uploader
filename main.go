@@ -218,6 +218,20 @@ func chunk[T any](in []T, n int) [][]T {
 	return out
 }
 
+func moveToIgnore(root, ignoreName, folderName string) error {
+	ignorePath := filepath.Join(root, ignoreName)
+	if err := os.MkdirAll(ignorePath, 0o755); err != nil {
+		return err
+	}
+	src := filepath.Join(root, folderName)
+	dst := filepath.Join(ignorePath, folderName)
+	if _, err := os.Stat(dst); err == nil {
+		// collision: append timestamp
+		dst = filepath.Join(ignorePath, fmt.Sprintf("%s-%d", folderName, time.Now().Unix()))
+	}
+	return os.Rename(src, dst)
+}
+
 func main() {
 	var (
 		baseURL   = flag.String("immich", "http://localhost:2283/api", "Immich base API URL (include /api). Example: https://photos.example.com/api")
@@ -227,6 +241,7 @@ func main() {
 		checksum  = flag.Bool("checksum", false, "If true, compute sha1 checksum and send x-immich-checksum header (slower)")
 		batchSize = flag.Int("batch", 200, "How many uploaded assets to add to album per request")
 		timeout   = flag.Duration("timeout", 5*time.Minute, "HTTP timeout")
+		ignoreDir = flag.String("ignore-dir", "ignore", "Folder name to ignore (and destination for moved folders)")
 	)
 	flag.Parse()
 
@@ -264,6 +279,9 @@ func main() {
 			continue
 		}
 		folderName := e.Name()
+		if folderName == *ignoreDir {
+			continue
+		}
 		folderPath := filepath.Join(*root, folderName)
 
 		albumID, ok := albums[folderName]
@@ -351,14 +369,24 @@ func main() {
 			continue
 		}
 
+		albumSuccess := true
+
 		// Add to album in batches
 		for _, ch := range chunk(uploadedIDs, *batchSize) {
 			if err := c.addAssetsToAlbum(ctx, albumID, ch); err != nil {
 				fmt.Fprintf(os.Stderr, "add assets to album %s failed: %v\n", folderName, err)
-				// keep going
+				albumSuccess = false
 			}
 		}
 		fmt.Printf("Album %s: added %d assets\n", folderName, len(uploadedIDs))
+
+		if albumSuccess {
+			if err := moveToIgnore(*root, *ignoreDir, folderName); err != nil {
+				fmt.Fprintf(os.Stderr, "move to %s failed for %s: %v\n", *ignoreDir, folderName, err)
+			} else {
+				fmt.Printf("Moved folder %s -> %s/\n", folderName, *ignoreDir)
+			}
+		}
 	}
 }
 

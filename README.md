@@ -38,9 +38,12 @@ go build -o immich-uploader ./
 - Uses file `mtime` for both `fileCreatedAt` and `fileModifiedAt`.
 - Filters to common photo/video extensions.
 - If an album with the same name already exists, it reuses it.
+- After a folder is successfully uploaded and added to the album, it is moved into the ignore folder (default `ignore/`).
 
 ## API endpoints used
 - `GET /albums`
 - `POST /albums`
 - `POST /assets` (multipart upload)
 - `PUT /albums/{id}/assets`
+
+- `--ignore-dir`: folder name to skip at root and to move successfully uploaded folders into (default `ignore`).
