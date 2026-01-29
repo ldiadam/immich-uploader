@@ -1,7 +1,5 @@
-name: build-windows
+name: build-windows (manual only)
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
 
 jobs:
