@@ -1,0 +1,33 @@
+name: build-windows
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Tidy
+        run: go mod tidy
+
+      - name: Build CLI (windows)
+        run: go build -o immich-uploader-windows-amd64.exe ./cmd/cli
+
+      - name: Build GUI (windows)
+        run: go build -ldflags "-H=windowsgui" -o immich-uploader-gui-windows-amd64.exe ./cmd/gui
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: |
+            immich-uploader-windows-amd64.exe
+            immich-uploader-gui-windows-amd64.exe
