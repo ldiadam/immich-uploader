@@ -223,7 +223,7 @@ func main() {
 		baseURL   = flag.String("immich", "http://localhost:2283/api", "Immich base API URL (include /api). Example: https://photos.example.com/api")
 		apiKey    = flag.String("key", "", "Immich API key (x-api-key)")
 		root      = flag.String("root", "", "Root folder containing album folders")
-		recursive = flag.Bool("recursive", false, "If true, upload files from nested subfolders too")
+		deep      = flag.Bool("deep", true, "If true (default), upload files from nested subfolders under each album folder")
 		checksum  = flag.Bool("checksum", false, "If true, compute sha1 checksum and send x-immich-checksum header (slower)")
 		batchSize = flag.Int("batch", 200, "How many uploaded assets to add to album per request")
 		timeout   = flag.Duration("timeout", 5*time.Minute, "HTTP timeout")
@@ -286,7 +286,7 @@ func main() {
 				return err
 			}
 			if d.IsDir() {
-				if path != folderPath && !*recursive {
+				if path != folderPath && !*deep {
 					return filepath.SkipDir
 				}
 				return nil

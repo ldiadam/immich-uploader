@@ -23,14 +23,14 @@ go build -o immich-uploader ./
   --immich "https://immich.example.com/api" \
   --key "YOUR_IMMICH_API_KEY" \
   --root "/path/to/photos" \
-  --recursive=false
+  --deep=true
 ```
 
 ### Flags
 - `--immich`: base API URL **including `/api`** (e.g. `http://localhost:2283/api`)
 - `--key`: Immich API key (sent as header `x-api-key`)
 - `--root`: root folder containing album folders
-- `--recursive`: if true, uploads nested subfolders too
+- `--deep`: if true (default), uploads nested subfolders too
 - `--checksum`: if true, computes sha1 of each file and sends `x-immich-checksum` (slower but better duplicate detection)
 - `--batch`: how many uploaded assets to add per album request
 
