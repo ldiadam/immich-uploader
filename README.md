@@ -31,7 +31,7 @@ go build -o immich-uploader ./
 - `--key`: Immich API key (sent as header `x-api-key`)
 - `--root`: root folder containing album folders
 - `--deep`: if true (default), uploads nested subfolders too
-- `--checksum`: if true, computes sha1 of each file and sends `x-immich-checksum` (slower but better duplicate detection)
+- `--checksum`: if true (default), computes sha1 of each file and sends `x-immich-checksum` (slower but better duplicate detection)
 - `--batch`: how many uploaded assets to add per album request
 
 ## Notes

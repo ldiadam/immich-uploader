@@ -293,7 +293,7 @@ func main() {
 		apiKey        = flag.String("key", "", "Immich API key (x-api-key)")
 		root          = flag.String("root", "", "Root folder containing album folders")
 		deep          = flag.Bool("deep", true, "If true (default), upload files from nested subfolders under each album folder")
-		checksum      = flag.Bool("checksum", false, "If true, compute sha1 checksum and send x-immich-checksum header (slower)")
+		checksum      = flag.Bool("checksum", true, "If true, compute sha1 checksum and send x-immich-checksum header (slower)")
 		batchSize     = flag.Int("batch", 200, "How many uploaded assets to add to album per request")
 		workers       = flag.Int("workers", 4, "Number of parallel upload workers per album")
 		smallestFirst = flag.Bool("smallest-first", true, "Upload smaller files first")
