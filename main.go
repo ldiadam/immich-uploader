@@ -234,6 +234,33 @@ func moveToIgnore(root, ignoreName, folderName string) error {
 	return os.Rename(src, dst)
 }
 
+func ensureIgnoreAlbumDir(root, ignoreName, albumName string) (string, error) {
+	base := filepath.Join(root, ignoreName, albumName)
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return "", err
+	}
+	return base, nil
+}
+
+func moveFileToIgnore(root, ignoreName, albumName, albumRoot, srcPath string) error {
+	// preserve relative path under the album root (including subfolders)
+	rel, err := filepath.Rel(albumRoot, srcPath)
+	if err != nil {
+		rel = filepath.Base(srcPath)
+	}
+	dst := filepath.Join(root, ignoreName, albumName, rel)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	// collision handling
+	if _, err := os.Stat(dst); err == nil {
+		ext := filepath.Ext(dst)
+		base := strings.TrimSuffix(filepath.Base(dst), ext)
+		dst = filepath.Join(filepath.Dir(dst), fmt.Sprintf("%s-%d%s", base, time.Now().UnixNano(), ext))
+	}
+	return os.Rename(srcPath, dst)
+}
+
 func formatBytes(n int64) string {
 	const (
 		KB = 1024
@@ -326,6 +353,11 @@ func main() {
 			albums[folderName] = id
 		} else {
 			fmt.Printf("Using existing album: %s\n", folderName)
+		}
+
+		if _, err := ensureIgnoreAlbumDir(*root, *ignoreDir, folderName); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create ignore folder for %s: %v\n", folderName, err)
+			continue
 		}
 
 		var files []string
@@ -444,6 +476,12 @@ func main() {
 					fileStart := time.Now()
 					asset, err := c.uploadAsset(ctx, job.path, deviceID, deviceAssetID, created, modified, sum)
 					fileDur := time.Since(fileStart)
+					if err == nil {
+						// move source file immediately after successful upload
+						if merr := moveFileToIgnore(*root, *ignoreDir, folderName, folderPath, job.path); merr != nil {
+							fmt.Fprintf(os.Stderr, "move failed (%s): %v\n", job.path, merr)
+						}
+					}
 					results <- uploadResult{idx: job.idx, path: job.path, size: job.size, asset: asset, dur: fileDur, err: err}
 				}
 			}()
@@ -489,24 +527,14 @@ func main() {
 			continue
 		}
 
-		albumSuccess := uploadErrors == 0
-
 		// Add to album in batches
 		for _, ch := range chunk(uploadedIDs, *batchSize) {
 			if err := c.addAssetsToAlbum(ctx, albumID, ch); err != nil {
 				fmt.Fprintf(os.Stderr, "add assets to album %s failed: %v\n", folderName, err)
-				albumSuccess = false
 			}
 		}
 		fmt.Printf("Album %s: added %d assets\n", folderName, len(uploadedIDs))
 
-		if albumSuccess {
-			if err := moveToIgnore(*root, *ignoreDir, folderName); err != nil {
-				fmt.Fprintf(os.Stderr, "move to %s failed for %s: %v\n", *ignoreDir, folderName, err)
-			} else {
-				fmt.Printf("Moved folder %s -> %s/\n", folderName, *ignoreDir)
-			}
-		}
 	}
 }
 
