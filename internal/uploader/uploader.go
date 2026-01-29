@@ -118,41 +118,68 @@ func (c *client) addAssetsToAlbum(ctx context.Context, albumID string, assetIDs 
 }
 
 func (c *client) uploadAsset(ctx context.Context, filePath, deviceID, deviceAssetID string, createdAt, modifiedAt time.Time, checksumSHA1 string) (assetUploadResponse, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return assetUploadResponse{}, err
-	}
-	defer f.Close()
+	// Stream multipart upload using io.Pipe to avoid buffering entire files in RAM.
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	contentType := mw.FormDataContentType()
 
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
+	go func() {
+		defer func() {
+			_ = pw.Close()
+		}()
 
-	// required fields
-	_ = mw.WriteField("deviceId", deviceID)
-	_ = mw.WriteField("deviceAssetId", deviceAssetID)
-	_ = mw.WriteField("fileCreatedAt", createdAt.UTC().Format(time.RFC3339Nano))
-	_ = mw.WriteField("fileModifiedAt", modifiedAt.UTC().Format(time.RFC3339Nano))
-	_ = mw.WriteField("filename", filepath.Base(filePath))
+		// required fields
+		if err := mw.WriteField("deviceId", deviceID); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := mw.WriteField("deviceAssetId", deviceAssetID); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := mw.WriteField("fileCreatedAt", createdAt.UTC().Format(time.RFC3339Nano)); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := mw.WriteField("fileModifiedAt", modifiedAt.UTC().Format(time.RFC3339Nano)); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := mw.WriteField("filename", filepath.Base(filePath)); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
 
-	part, err := mw.CreateFormFile("assetData", filepath.Base(filePath))
-	if err != nil {
-		return assetUploadResponse{}, err
-	}
-	if _, err := io.Copy(part, f); err != nil {
-		return assetUploadResponse{}, err
-	}
+		part, err := mw.CreateFormFile("assetData", filepath.Base(filePath))
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		f, err := os.Open(filePath)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_, err = io.Copy(part, f)
+		_ = f.Close()
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
 
-	if err := mw.Close(); err != nil {
-		return assetUploadResponse{}, err
-	}
+		if err := mw.Close(); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+	}()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/assets", &buf)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/assets", pr)
 	if err != nil {
 		return assetUploadResponse{}, err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-api-key", c.apiKey)
-	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Content-Type", contentType)
 	if checksumSHA1 != "" {
 		req.Header.Set("x-immich-checksum", checksumSHA1)
 	}
