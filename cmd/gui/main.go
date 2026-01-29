@@ -113,11 +113,13 @@ func main() {
 	logBox.Wrapping = fyne.TextWrapBreak
 	logBox.Disable()
 
+	scroll := container.NewVScroll(logBox)
+
 	appendLog := func(s string) {
 		logBox.Enable()
 		logBox.SetText(logBox.Text + s)
-		logBox.CursorDown()
 		logBox.Disable()
+		scroll.ScrollToBottom()
 	}
 
 	pickBtn := widget.NewButton("Choose root folder...", func() {
@@ -137,7 +139,8 @@ func main() {
 	runningMu := sync.Mutex{}
 	running := false
 
-	startBtn := widget.NewButton("Start upload", func() {
+	var startBtn *widget.Button
+	startBtn = widget.NewButton("Start upload", func() {
 		runningMu.Lock()
 		if running {
 			runningMu.Unlock()
@@ -194,10 +197,10 @@ func main() {
 
 			err := uploader.Run(context.Background(), opt, func(format string, args ...any) {
 				msg := fmt.Sprintf(format, args...)
-				a.Driver().RunOnMain(func() { appendLog(msg) })
+				fyne.Do(func() { appendLog(msg) })
 			})
 
-			a.Driver().RunOnMain(func() {
+			fyne.Do(func() {
 				if err != nil {
 					dialog.ShowError(err, w)
 				} else {
@@ -222,7 +225,7 @@ func main() {
 	w.SetContent(container.NewBorder(
 		container.NewVBox(form, checks, startBtn),
 		nil, nil, nil,
-		container.NewScroll(logBox),
+		scroll,
 	))
 
 	w.ShowAndRun()
