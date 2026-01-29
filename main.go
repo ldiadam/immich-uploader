@@ -232,6 +232,32 @@ func moveToIgnore(root, ignoreName, folderName string) error {
 	return os.Rename(src, dst)
 }
 
+func formatBytes(n int64) string {
+	const (
+		KB = 1024
+		MB = 1024 * KB
+		GB = 1024 * MB
+	)
+	switch {
+	case n >= GB:
+		return fmt.Sprintf("%.2fGiB", float64(n)/float64(GB))
+	case n >= MB:
+		return fmt.Sprintf("%.2fMiB", float64(n)/float64(MB))
+	case n >= KB:
+		return fmt.Sprintf("%.2fKiB", float64(n)/float64(KB))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
+}
+
+func formatRate(bytes int64, d time.Duration) string {
+	if d <= 0 {
+		return "-"
+	}
+	rate := float64(bytes) / d.Seconds() // B/s
+	return fmt.Sprintf("%s/s", formatBytes(int64(rate)))
+}
+
 func main() {
 	var (
 		baseURL   = flag.String("immich", "http://localhost:2283/api", "Immich base API URL (include /api). Example: https://photos.example.com/api")
@@ -329,7 +355,15 @@ func main() {
 			continue
 		}
 
-		fmt.Printf("Uploading %d files from %s...\n", len(files), folderName)
+		totalBytes := int64(0)
+		for _, fp := range files {
+			if st, err := os.Stat(fp); err == nil {
+				totalBytes += st.Size()
+			}
+		}
+		albumStart := time.Now()
+		uploadedBytes := int64(0)
+		fmt.Printf("Uploading %d files (%s) from %s...\n", len(files), formatBytes(totalBytes), folderName)
 		var uploadedIDs []string
 		for i, fp := range files {
 			st, err := os.Stat(fp)
@@ -355,12 +389,19 @@ func main() {
 				}
 			}
 
+			fileStart := time.Now()
 			resp, err := c.uploadAsset(ctx, fp, deviceID, deviceAssetID, created, modified, sum)
+			fileDur := time.Since(fileStart)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "upload failed (%s): %v\n", fp, err)
 				continue
 			}
 			uploadedIDs = append(uploadedIDs, resp.ID)
+			uploadedBytes += st.Size()
+			elapsed := time.Since(albumStart)
+			// progress line
+			fmt.Printf("    Progress: %d/%d (%s/%s) | avg %s | last %s (%s)\n",
+				i+1, len(files), formatBytes(uploadedBytes), formatBytes(totalBytes), formatRate(uploadedBytes, elapsed), formatRate(st.Size(), fileDur), fileDur.Round(time.Millisecond))
 			fmt.Printf("  [%d/%d] %s -> %s (%s)\n", i+1, len(files), filepath.Base(fp), resp.ID, resp.Status)
 		}
 
