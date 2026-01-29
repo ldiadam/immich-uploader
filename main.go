@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -261,15 +262,16 @@ func formatRate(bytes int64, d time.Duration) string {
 
 func main() {
 	var (
-		baseURL   = flag.String("immich", "http://localhost:2283/api", "Immich base API URL (include /api). Example: https://photos.example.com/api")
-		apiKey    = flag.String("key", "", "Immich API key (x-api-key)")
-		root      = flag.String("root", "", "Root folder containing album folders")
-		deep      = flag.Bool("deep", true, "If true (default), upload files from nested subfolders under each album folder")
-		checksum  = flag.Bool("checksum", false, "If true, compute sha1 checksum and send x-immich-checksum header (slower)")
-		batchSize = flag.Int("batch", 200, "How many uploaded assets to add to album per request")
-		workers   = flag.Int("workers", 4, "Number of parallel upload workers per album")
-		timeout   = flag.Duration("timeout", 5*time.Minute, "HTTP timeout")
-		ignoreDir = flag.String("ignore-dir", "ignore", "Folder name to ignore (and destination for moved folders)")
+		baseURL       = flag.String("immich", "http://localhost:2283/api", "Immich base API URL (include /api). Example: https://photos.example.com/api")
+		apiKey        = flag.String("key", "", "Immich API key (x-api-key)")
+		root          = flag.String("root", "", "Root folder containing album folders")
+		deep          = flag.Bool("deep", true, "If true (default), upload files from nested subfolders under each album folder")
+		checksum      = flag.Bool("checksum", false, "If true, compute sha1 checksum and send x-immich-checksum header (slower)")
+		batchSize     = flag.Int("batch", 200, "How many uploaded assets to add to album per request")
+		workers       = flag.Int("workers", 4, "Number of parallel upload workers per album")
+		smallestFirst = flag.Bool("smallest-first", true, "Upload smaller files first")
+		timeout       = flag.Duration("timeout", 5*time.Minute, "HTTP timeout")
+		ignoreDir     = flag.String("ignore-dir", "ignore", "Folder name to ignore (and destination for moved folders)")
 	)
 	flag.Parse()
 
@@ -355,6 +357,26 @@ func main() {
 		if len(files) == 0 {
 			fmt.Printf("No media files in %s, skipping\n", folderName)
 			continue
+		}
+
+		if *smallestFirst {
+			sort.Slice(files, func(i, j int) bool {
+				sti, err1 := os.Stat(files[i])
+				stj, err2 := os.Stat(files[j])
+				if err1 != nil && err2 != nil {
+					return files[i] < files[j]
+				}
+				if err1 != nil {
+					return false
+				}
+				if err2 != nil {
+					return true
+				}
+				if sti.Size() == stj.Size() {
+					return files[i] < files[j]
+				}
+				return sti.Size() < stj.Size()
+			})
 		}
 
 		totalBytes := int64(0)
