@@ -23,6 +23,8 @@ func main() {
 		dedupeAdd     = flag.Bool("dedupe-add", true, "If true, rely on checksum dedupe so existing assets can still be added to the album")
 		timeout       = flag.Duration("timeout", 5*time.Minute, "HTTP timeout")
 		ignoreDir     = flag.String("ignore-dir", "ignore", "Folder name to ignore (and destination for moved folders)")
+		tui           = flag.Bool("tui", true, "Use a single-line updating status display")
+		noANSI        = flag.Bool("no-ansi", false, "Disable ANSI escape sequences (best-effort)")
 	)
 	flag.Parse()
 
@@ -38,6 +40,8 @@ func main() {
 		IgnoreDir:     *ignoreDir,
 		Timeout:       *timeout,
 		DedupeAdd:     *dedupeAdd,
+		TUI:           *tui,
+		NoANSI:        *noANSI,
 	}
 
 	if err := uploader.Run(context.Background(), opt, func(format string, args ...any) {

@@ -338,6 +338,19 @@ func formatRate(bytes int64, d time.Duration) string {
 	return fmt.Sprintf("%s/s", formatBytes(int64(rate)))
 }
 
+func formatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%02d:%02d", m, s)
+}
+
 type Options struct {
 	BaseURL       string
 	APIKey        string
@@ -352,13 +365,18 @@ type Options struct {
 	// DedupeAdd: if true, rely on server-side checksum dedupe during upload.
 	// (Future: add /assets/bulk-upload-check preflight.)
 	DedupeAdd bool
+	TUI       bool
+	NoANSI    bool
 }
 
 type Logf func(format string, args ...any)
 
 func Run(ctx context.Context, opt Options, logf Logf) error {
+	tuiEnabled := opt.TUI
+	noANSI := opt.NoANSI
+
 	if logf == nil {
-		logf = func(format string, args ...any) { fmt.Printf(format, args...) }
+		logf = func(format string, args ...any) { fmt.Fprintf(os.Stdout, format, args...) }
 	}
 	if opt.APIKey == "" {
 		return fmt.Errorf("missing API key")
@@ -382,6 +400,94 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 
 	deviceID := "immich-folder-uploader-" + runtime.GOOS
 
+	type tuiState struct {
+		sync.Mutex
+		albumName       string
+		albumTotal      int
+		albumDone       int
+		albumBytes      int64
+		albumTotalBytes int64
+		albumStart      time.Time
+		globalAlbums    int
+		globalFiles     int
+		globalDup       int
+		globalFailed    int
+		globalMovedFail int
+		globalBytes     int64
+		globalStart     time.Time
+	}
+	tui := &tuiState{globalStart: time.Now()}
+
+	renderLine := func() string {
+		tui.Lock()
+		defer tui.Unlock()
+		if tui.albumName == "" {
+			elapsed := time.Since(tui.globalStart)
+			return fmt.Sprintf("Idle | elapsed %s | albums %d | files %d | dup %d | failed %d | moved-fail %d | %s", formatDuration(elapsed), tui.globalAlbums, tui.globalFiles, tui.globalDup, tui.globalFailed, tui.globalMovedFail, formatBytes(tui.globalBytes))
+		}
+		elapsed := time.Since(tui.albumStart)
+		avg := formatRate(tui.albumBytes, elapsed)
+		eta := "-"
+		if tui.albumBytes > 0 && elapsed > 0 {
+			rate := float64(tui.albumBytes) / elapsed.Seconds()
+			rem := float64(tui.albumTotalBytes - tui.albumBytes)
+			if rate > 0 && rem > 0 {
+				eta = formatDuration(time.Duration(rem/rate) * time.Second)
+			} else {
+				eta = "00:00"
+			}
+		}
+		return fmt.Sprintf("%s | %d/%d | %s/%s | avg %s | ETA %s | dup %d | failed %d", tui.albumName, tui.albumDone, tui.albumTotal, formatBytes(tui.albumBytes), formatBytes(tui.albumTotalBytes), avg, eta, tui.globalDup, tui.globalFailed)
+	}
+
+	clearAndPrint := func(line string) {
+		if !tuiEnabled {
+			return
+		}
+		if noANSI {
+			// best-effort: carriage return and pad
+			pad := ""
+			if len(line) < 120 {
+				pad = strings.Repeat(" ", 120-len(line))
+			}
+			fmt.Fprintf(os.Stdout, "\r%s%s", line, pad)
+			return
+		}
+		// ANSI clear line + CR
+		fmt.Fprintf(os.Stdout, "\r\x1b[2K%s", line)
+	}
+
+	eventf := func(format string, args ...any) {
+		if tuiEnabled {
+			// print event on its own line
+			if noANSI {
+				fmt.Fprint(os.Stdout, "\r")
+			} else {
+				fmt.Fprint(os.Stdout, "\r\x1b[2K")
+			}
+			logf(format, args...)
+			clearAndPrint(renderLine())
+			return
+		}
+		logf(format, args...)
+	}
+
+	if tuiEnabled {
+		// periodic status refresh
+		go func() {
+			t := time.NewTicker(250 * time.Millisecond)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					clearAndPrint(renderLine())
+				}
+			}
+		}()
+	}
+
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -394,20 +500,20 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 
 		albumID, ok := albums[folderName]
 		if !ok {
-			logf("Creating album: %s\n", folderName)
+			eventf("Creating album: %s\n", folderName)
 			id, err := c.createAlbum(ctx, folderName)
 			if err != nil {
-				logf("create album %q failed: %v\n", folderName, err)
+				eventf("create album %q failed: %v\n", folderName, err)
 				continue
 			}
 			albumID = id
 			albums[folderName] = id
 		} else {
-			logf("Using existing album: %s\n", folderName)
+			eventf("Using existing album: %s\n", folderName)
 		}
 
 		if _, err := ensureIgnoreAlbumDir(opt.Root, opt.IgnoreDir, folderName); err != nil {
-			logf("failed to create ignore folder for %s: %v\n", folderName, err)
+			eventf("failed to create ignore folder for %s: %v\n", folderName, err)
 			continue
 		}
 
@@ -434,11 +540,11 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 		}
 
 		if err := filepath.WalkDir(folderPath, walkFn); err != nil {
-			logf("walk %s: %v\n", folderName, err)
+			eventf("walk %s: %v\n", folderName, err)
 			continue
 		}
 		if len(files) == 0 {
-			logf("No media files in %s, skipping\n", folderName)
+			eventf("No media files in %s, skipping\n", folderName)
 			continue
 		}
 
@@ -470,7 +576,7 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 		}
 		albumStart := time.Now()
 		uploadedBytes := int64(0)
-		logf("Uploading %d files (%s) from %s...\n", len(files), formatBytes(totalBytes), folderName)
+		eventf("Uploading %d files (%s) from %s...\n", len(files), formatBytes(totalBytes), folderName)
 
 		uploadedIDs := make([]string, 0, len(files))
 		uploadErrors := 0
@@ -530,7 +636,12 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 					fileDur := time.Since(fileStart)
 					if err == nil {
 						if merr := moveFileToIgnore(opt.Root, opt.IgnoreDir, folderName, folderPath, job.path); merr != nil {
-							logf("move failed (%s): %v\n", job.path, merr)
+							eventf("move failed (%s): %v\n", job.path, merr)
+							if tuiEnabled {
+								tui.Lock()
+								tui.globalMovedFail++
+								tui.Unlock()
+							}
 						}
 					}
 					results <- uploadResult{idx: job.idx, path: job.path, size: job.size, asset: asset, dur: fileDur, err: err}
@@ -558,34 +669,66 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 			completed++
 			if res.err != nil {
 				uploadErrors++
-				logf("upload failed (%s): %v\n", res.path, res.err)
+				eventf("upload failed (%s): %v\n", res.path, res.err)
+				if tuiEnabled {
+					tui.Lock()
+					tui.globalFailed++
+					tui.Unlock()
+				}
 				continue
 			}
 			uploadedIDs = append(uploadedIDs, res.asset.ID)
+			if tuiEnabled {
+				tui.Lock()
+				tui.globalFiles++
+				if strings.Contains(strings.ToLower(res.asset.Status), "duplicate") {
+					tui.globalDup++
+				}
+				tui.Unlock()
+			}
+
 			uploadedBytesMu.Lock()
 			uploadedBytes += res.size
 			elapsed := time.Since(albumStart)
-			logf("    Progress: %d/%d (%s/%s) | avg %s | last %s (%s)\n",
-				completed, len(files), formatBytes(uploadedBytes), formatBytes(totalBytes), formatRate(uploadedBytes, elapsed), formatRate(res.size, res.dur), res.dur.Round(time.Millisecond))
-			logf("  [%d/%d] %s -> %s (%s)\n", completed, len(files), filepath.Base(res.path), res.asset.ID, res.asset.Status)
+			if tuiEnabled {
+				tui.Lock()
+				tui.albumDone = completed
+				tui.albumBytes = uploadedBytes
+				tui.globalBytes = tui.globalBytes + res.size
+				tui.Unlock()
+				clearAndPrint(renderLine())
+			} else {
+				logf("    Progress: %d/%d (%s/%s) | avg %s | last %s (%s)\n",
+					completed, len(files), formatBytes(uploadedBytes), formatBytes(totalBytes), formatRate(uploadedBytes, elapsed), formatRate(res.size, res.dur), res.dur.Round(time.Millisecond))
+			}
+
+			if !tuiEnabled {
+				logf("  [%d/%d] %s -> %s (%s)\n", completed, len(files), filepath.Base(res.path), res.asset.ID, res.asset.Status)
+			}
 			uploadedBytesMu.Unlock()
 		}
 
 		if len(uploadedIDs) == 0 {
-			logf("No uploads succeeded for %s\n", folderName)
+			eventf("No uploads succeeded for %s\n", folderName)
 			continue
 		}
 
 		if uploadErrors > 0 {
-			logf("Album %s: %d upload errors (still adding successful assets to album)\n", folderName, uploadErrors)
+			eventf("Album %s: %d upload errors (still adding successful assets to album)\n", folderName, uploadErrors)
 		}
 
 		for _, ch := range chunk(uploadedIDs, opt.BatchSize) {
 			if err := c.addAssetsToAlbum(ctx, albumID, ch); err != nil {
-				logf("add assets to album %s failed: %v\n", folderName, err)
+				eventf("add assets to album %s failed: %v\n", folderName, err)
 			}
 		}
-		logf("Album %s: added %d assets\n", folderName, len(uploadedIDs))
+		eventf("Album %s: added %d assets\n", folderName, len(uploadedIDs))
+		if tuiEnabled {
+			tui.Lock()
+			tui.albumName = ""
+			tui.Unlock()
+			fmt.Fprint(os.Stdout, "\r")
+		}
 	}
 
 	return nil
