@@ -23,7 +23,9 @@ func main() {
 		dedupeAdd     = flag.Bool("dedupe-add", true, "If true, rely on checksum dedupe so existing assets can still be added to the album")
 		timeout       = flag.Duration("timeout", 5*time.Minute, "HTTP timeout")
 		ignoreDir     = flag.String("ignore-dir", "ignore", "Folder name to ignore (and destination for moved folders)")
-		tui           = flag.Bool("tui", true, "Use a single-line updating status display")
+		tui           = flag.Bool("tui", false, "Enable single-line TUI status display")
+		tuiAuto       = flag.Bool("tui-auto", true, "Auto-enable TUI only when stdout is a terminal (recommended)")
+		tuiStyle      = flag.String("tui-style", "pretty", "TUI style: pretty|plain")
 		noANSI        = flag.Bool("no-ansi", false, "Disable ANSI escape sequences (best-effort)")
 	)
 	flag.Parse()
@@ -41,6 +43,8 @@ func main() {
 		Timeout:       *timeout,
 		DedupeAdd:     *dedupeAdd,
 		TUI:           *tui,
+		TUIAuto:       *tuiAuto,
+		TUIStyle:      *tuiStyle,
 		NoANSI:        *noANSI,
 	}
 

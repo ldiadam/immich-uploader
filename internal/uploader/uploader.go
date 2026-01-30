@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"golang.org/x/term"
 	"time"
 )
 
@@ -351,6 +353,24 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
+func isTTY() bool {
+	return term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+type tuiStyle string
+
+const (
+	tuiStylePretty tuiStyle = "pretty"
+	tuiStylePlain  tuiStyle = "plain"
+)
+
+func colorize(enabled bool, code, text string) string {
+	if !enabled {
+		return text
+	}
+	return "[" + code + "m" + text + "[0m"
+}
+
 type Options struct {
 	BaseURL       string
 	APIKey        string
@@ -366,6 +386,8 @@ type Options struct {
 	// (Future: add /assets/bulk-upload-check preflight.)
 	DedupeAdd bool
 	TUI       bool
+	TUIAuto   bool
+	TUIStyle  string
 	NoANSI    bool
 }
 
@@ -374,6 +396,16 @@ type Logf func(format string, args ...any)
 func Run(ctx context.Context, opt Options, logf Logf) error {
 	tuiEnabled := opt.TUI
 	noANSI := opt.NoANSI
+	style := tuiStyle(opt.TUIStyle)
+	if style == "" {
+		style = tuiStylePretty
+	}
+	if opt.TUIAuto {
+		tuiEnabled = isTTY()
+	}
+	if !isTTY() {
+		noANSI = true
+	}
 
 	if logf == nil {
 		logf = func(format string, args ...any) { fmt.Fprintf(os.Stdout, format, args...) }
@@ -421,10 +453,14 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 	renderLine := func() string {
 		tui.Lock()
 		defer tui.Unlock()
+		pretty := !noANSI && style == tuiStylePretty
+
 		if tui.albumName == "" {
 			elapsed := time.Since(tui.globalStart)
-			return fmt.Sprintf("Idle | elapsed %s | albums %d | files %d | dup %d | failed %d | moved-fail %d | %s", formatDuration(elapsed), tui.globalAlbums, tui.globalFiles, tui.globalDup, tui.globalFailed, tui.globalMovedFail, formatBytes(tui.globalBytes))
+			base := fmt.Sprintf("Idle | elapsed %s | albums %d | files %d | dup %d | fail %d | moved-fail %d | %s", formatDuration(elapsed), tui.globalAlbums, tui.globalFiles, tui.globalDup, tui.globalFailed, tui.globalMovedFail, formatBytes(tui.globalBytes))
+			return colorize(pretty, "90", base)
 		}
+
 		elapsed := time.Since(tui.albumStart)
 		avg := formatRate(tui.albumBytes, elapsed)
 		eta := "-"
@@ -437,7 +473,16 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 				eta = "00:00"
 			}
 		}
-		return fmt.Sprintf("%s | %d/%d | %s/%s | avg %s | ETA %s | dup %d | failed %d", tui.albumName, tui.albumDone, tui.albumTotal, formatBytes(tui.albumBytes), formatBytes(tui.albumTotalBytes), avg, eta, tui.globalDup, tui.globalFailed)
+
+		name := colorize(pretty, "36", tui.albumName)
+		count := colorize(pretty, "33", fmt.Sprintf("%d/%d", tui.albumDone, tui.albumTotal))
+		bytes := colorize(pretty, "32", fmt.Sprintf("%s/%s", formatBytes(tui.albumBytes), formatBytes(tui.albumTotalBytes)))
+		speed := colorize(pretty, "35", "avg "+avg)
+		etaS := colorize(pretty, "35", "ETA "+eta)
+		dup := colorize(pretty, "34", fmt.Sprintf("dup %d", tui.globalDup))
+		fail := colorize(pretty, "31", fmt.Sprintf("fail %d", tui.globalFailed))
+
+		return fmt.Sprintf("%s | %s | %s | %s | %s | %s | %s", name, count, bytes, speed, etaS, dup, fail)
 	}
 
 	clearAndPrint := func(line string) {
