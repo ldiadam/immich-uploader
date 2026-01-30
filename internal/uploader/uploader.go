@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -16,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -284,7 +286,30 @@ func moveFileToIgnore(root, ignoreName, albumName, albumRoot, srcPath string) er
 		base := strings.TrimSuffix(filepath.Base(dst), ext)
 		dst = filepath.Join(filepath.Dir(dst), fmt.Sprintf("%s-%d%s", base, time.Now().UnixNano(), ext))
 	}
-	return os.Rename(srcPath, dst)
+
+	// On Windows, renames can fail transiently with sharing violations (e.g. AV scan / Explorer preview).
+	// Retry a few times before giving up.
+	var lastErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		err := os.Rename(srcPath, dst)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		// Retry only for common "file in use" cases.
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			if errno != 32 && errno != 33 { // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION
+				break
+			}
+		} else if !strings.Contains(strings.ToLower(err.Error()), "being used by another process") {
+			break
+		}
+
+		time.Sleep(time.Duration(150*(attempt+1)) * time.Millisecond)
+	}
+	return lastErr
 }
 
 func formatBytes(n int64) string {
