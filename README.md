@@ -8,12 +8,13 @@ Simple Go program that:
 ## Requirements
 - Immich server reachable
 - An Immich **API key** (Settings → API Keys)
-- Go 1.20+
+- Go 1.23+
 
 ## Build
 
 ```bash
-go build -o immich-uploader ./
+go build -o immich-uploader ./cmd/cli
+go build -o immich-uploader-tui ./cmd/tui
 ```
 
 ## Run
@@ -25,6 +26,33 @@ go build -o immich-uploader ./
   --root "/path/to/photos" \
   --deep=true
 ```
+
+Interactive TUI mode (Bubble Tea):
+
+```bash
+./immich-uploader-tui \
+  --immich "https://immich.example.com/api" \
+  --key "YOUR_IMMICH_API_KEY" \
+  --root "/path/to/photos"
+```
+
+TUI keys:
+- `q` / `Ctrl+C`: quit
+- `v`: toggle recent event panel
+
+Wizard + saved config:
+- On first run (or with `--wizard`), TUI opens a setup wizard.
+- Wizard saves config to `~/.config/immich-uploader/tui-config.json` by default.
+- Use `--config /path/to/file.json` to use a custom config file.
+- After config exists, you can run with no upload flags:
+
+```bash
+./immich-uploader-tui
+```
+
+Wizard keys:
+- `Tab` / `Shift+Tab`: move fields
+- `Ctrl+S`: save config and start upload
 
 ### Flags
 - `--immich`: base API URL **including `/api`** (e.g. `http://localhost:2283/api`)

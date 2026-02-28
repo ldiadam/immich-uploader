@@ -314,6 +314,38 @@ func moveFileToIgnore(root, ignoreName, albumName, albumRoot, srcPath string) er
 	return lastErr
 }
 
+func pruneEmptyDirs(startDir, stopDir string) {
+	startAbs, err1 := filepath.Abs(startDir)
+	stopAbs, err2 := filepath.Abs(stopDir)
+	if err1 != nil || err2 != nil {
+		return
+	}
+	rel, err := filepath.Rel(stopAbs, startAbs)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return
+	}
+
+	cur := startAbs
+	for {
+		if cur == "." || cur == string(filepath.Separator) {
+			break
+		}
+		err := os.Remove(cur)
+		if err != nil {
+			// Stop when directory is not empty or cannot be removed.
+			break
+		}
+		if cur == stopAbs {
+			break
+		}
+		next := filepath.Dir(cur)
+		if next == cur {
+			break
+		}
+		cur = next
+	}
+}
+
 func formatBytes(n int64) string {
 	const (
 		KB = 1024
@@ -353,6 +385,23 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
+func progressBar(width int, ratio float64) string {
+	if width <= 0 {
+		return ""
+	}
+	if ratio < 0 {
+		ratio = 0
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+	filled := int(ratio * float64(width))
+	if filled > width {
+		filled = width
+	}
+	return "[" + strings.Repeat("=", filled) + strings.Repeat(".", width-filled) + "]"
+}
+
 func isTTY() bool {
 	return term.IsTerminal(int(os.Stdout.Fd()))
 }
@@ -389,11 +438,61 @@ type Options struct {
 	TUIAuto   bool
 	TUIStyle  string
 	NoANSI    bool
+	OnEvent   EventFunc
 }
 
 type Logf func(format string, args ...any)
 
+type EventKind string
+
+const (
+	EventRunStarted    EventKind = "run_started"
+	EventRunCompleted  EventKind = "run_completed"
+	EventAlbumStarted  EventKind = "album_started"
+	EventAlbumSkipped  EventKind = "album_skipped"
+	EventAlbumFinished EventKind = "album_finished"
+	EventAlbumError    EventKind = "album_error"
+	EventFileUploaded  EventKind = "file_uploaded"
+	EventFileFailed    EventKind = "file_failed"
+	EventMoveFailed    EventKind = "move_failed"
+)
+
+type Event struct {
+	Time            time.Time
+	Kind            EventKind
+	AlbumName       string
+	AlbumIndex      int
+	AlbumTotal      int
+	AlbumDone       int
+	AlbumFileCount  int
+	AlbumBytes      int64
+	AlbumTotalBytes int64
+	FilePath        string
+	FileName        string
+	AssetID         string
+	AssetStatus     string
+	Message         string
+	Error           string
+	GlobalFiles     int
+	GlobalDup       int
+	GlobalFailed    int
+	GlobalMovedFail int
+	GlobalBytes     int64
+}
+
+type EventFunc func(Event)
+
 func Run(ctx context.Context, opt Options, logf Logf) error {
+	emit := func(ev Event) {
+		if opt.OnEvent == nil {
+			return
+		}
+		if ev.Time.IsZero() {
+			ev.Time = time.Now()
+		}
+		opt.OnEvent(ev)
+	}
+
 	tuiEnabled := opt.TUI
 	noANSI := opt.NoANSI
 	style := tuiStyle(opt.TUIStyle)
@@ -440,7 +539,9 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 		albumBytes      int64
 		albumTotalBytes int64
 		albumStart      time.Time
+		albumLast       string
 		globalAlbums    int
+		globalTotal     int
 		globalFiles     int
 		globalDup       int
 		globalFailed    int
@@ -457,13 +558,29 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 
 		if tui.albumName == "" {
 			elapsed := time.Since(tui.globalStart)
-			base := fmt.Sprintf("Idle | elapsed %s | albums %d | files %d | dup %d | fail %d | moved-fail %d | %s", formatDuration(elapsed), tui.globalAlbums, tui.globalFiles, tui.globalDup, tui.globalFailed, tui.globalMovedFail, formatBytes(tui.globalBytes))
+			issues := colorize(pretty && tui.globalFailed == 0 && tui.globalMovedFail == 0, "32", "clean")
+			if tui.globalFailed > 0 || tui.globalMovedFail > 0 {
+				issues = colorize(pretty, "31", fmt.Sprintf("fail %d | moved-fail %d", tui.globalFailed, tui.globalMovedFail))
+			}
+			base := fmt.Sprintf("Idle | elapsed %s | albums %d/%d | files %d | dup %d | %s | %s",
+				formatDuration(elapsed), tui.globalAlbums, tui.globalTotal, tui.globalFiles, tui.globalDup, issues, formatBytes(tui.globalBytes))
 			return colorize(pretty, "90", base)
 		}
 
 		elapsed := time.Since(tui.albumStart)
 		avg := formatRate(tui.albumBytes, elapsed)
 		eta := "-"
+		doneRatio := 0.0
+		if tui.albumTotal > 0 {
+			doneRatio = float64(tui.albumDone) / float64(tui.albumTotal)
+		}
+		byteRatio := 0.0
+		if tui.albumTotalBytes > 0 {
+			byteRatio = float64(tui.albumBytes) / float64(tui.albumTotalBytes)
+			if byteRatio > 1 {
+				byteRatio = 1
+			}
+		}
 		if tui.albumBytes > 0 && elapsed > 0 {
 			rate := float64(tui.albumBytes) / elapsed.Seconds()
 			rem := float64(tui.albumTotalBytes - tui.albumBytes)
@@ -475,14 +592,36 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 		}
 
 		name := colorize(pretty, "36", tui.albumName)
+		bar := progressBar(18, doneRatio)
+		if pretty {
+			bar = colorize(true, "36", bar)
+		}
 		count := colorize(pretty, "33", fmt.Sprintf("%d/%d", tui.albumDone, tui.albumTotal))
 		bytes := colorize(pretty, "32", fmt.Sprintf("%s/%s", formatBytes(tui.albumBytes), formatBytes(tui.albumTotalBytes)))
 		speed := colorize(pretty, "35", "avg "+avg)
 		etaS := colorize(pretty, "35", "ETA "+eta)
-		dup := colorize(pretty, "34", fmt.Sprintf("dup %d", tui.globalDup))
-		fail := colorize(pretty, "31", fmt.Sprintf("fail %d", tui.globalFailed))
 
-		return fmt.Sprintf("%s | %s | %s | %s | %s | %s | %s", name, count, bytes, speed, etaS, dup, fail)
+		dup := fmt.Sprintf("dup %d", tui.globalDup)
+		if tui.globalDup > 0 {
+			dup = colorize(pretty, "34", dup)
+		} else {
+			dup = colorize(pretty, "90", dup)
+		}
+
+		fail := fmt.Sprintf("fail %d", tui.globalFailed)
+		if tui.globalFailed > 0 {
+			fail = colorize(pretty, "31", fail)
+		} else {
+			fail = colorize(pretty, "90", fail)
+		}
+
+		last := ""
+		if tui.albumLast != "" {
+			last = " | last " + tui.albumLast
+		}
+
+		return fmt.Sprintf("%s %s | files %s | bytes %s (%d%%) | %s | %s | album %d/%d | %s | %s%s",
+			name, bar, count, bytes, int(byteRatio*100), speed, etaS, tui.globalAlbums+1, tui.globalTotal, dup, fail, last)
 	}
 
 	clearAndPrint := func(line string) {
@@ -517,6 +656,23 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 		logf(format, args...)
 	}
 
+	totalAlbums := 0
+	for _, e := range entries {
+		if e.IsDir() && e.Name() != opt.IgnoreDir {
+			totalAlbums++
+		}
+	}
+	tui.Lock()
+	tui.globalTotal = totalAlbums
+	tui.Unlock()
+	emit(Event{Kind: EventRunStarted, AlbumTotal: totalAlbums})
+
+	globalFiles := 0
+	globalDup := 0
+	globalFailed := 0
+	globalMovedFail := 0
+	globalBytes := int64(0)
+
 	if tuiEnabled {
 		// periodic status refresh
 		go func() {
@@ -549,6 +705,14 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 			id, err := c.createAlbum(ctx, folderName)
 			if err != nil {
 				eventf("create album %q failed: %v\n", folderName, err)
+				emit(Event{
+					Kind:       EventAlbumError,
+					AlbumName:  folderName,
+					AlbumIndex: tui.globalAlbums + 1,
+					AlbumTotal: totalAlbums,
+					Error:      err.Error(),
+					Message:    "create album failed",
+				})
 				continue
 			}
 			albumID = id
@@ -559,6 +723,14 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 
 		if _, err := ensureIgnoreAlbumDir(opt.Root, opt.IgnoreDir, folderName); err != nil {
 			eventf("failed to create ignore folder for %s: %v\n", folderName, err)
+			emit(Event{
+				Kind:       EventAlbumError,
+				AlbumName:  folderName,
+				AlbumIndex: tui.globalAlbums + 1,
+				AlbumTotal: totalAlbums,
+				Error:      err.Error(),
+				Message:    "failed to create ignore folder",
+			})
 			continue
 		}
 
@@ -586,10 +758,25 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 
 		if err := filepath.WalkDir(folderPath, walkFn); err != nil {
 			eventf("walk %s: %v\n", folderName, err)
+			emit(Event{
+				Kind:       EventAlbumError,
+				AlbumName:  folderName,
+				AlbumIndex: tui.globalAlbums + 1,
+				AlbumTotal: totalAlbums,
+				Error:      err.Error(),
+				Message:    "walk failed",
+			})
 			continue
 		}
 		if len(files) == 0 {
 			eventf("No media files in %s, skipping\n", folderName)
+			emit(Event{
+				Kind:       EventAlbumSkipped,
+				AlbumName:  folderName,
+				AlbumIndex: tui.globalAlbums + 1,
+				AlbumTotal: totalAlbums,
+				Message:    "no media files",
+			})
 			continue
 		}
 
@@ -620,8 +807,28 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 			}
 		}
 		albumStart := time.Now()
-		uploadedBytes := int64(0)
+		processedBytes := int64(0)
 		eventf("Uploading %d files (%s) from %s...\n", len(files), formatBytes(totalBytes), folderName)
+		if tuiEnabled {
+			tui.Lock()
+			tui.albumName = folderName
+			tui.albumTotal = len(files)
+			tui.albumDone = 0
+			tui.albumBytes = 0
+			tui.albumTotalBytes = totalBytes
+			tui.albumStart = albumStart
+			tui.albumLast = ""
+			tui.Unlock()
+			clearAndPrint(renderLine())
+		}
+		emit(Event{
+			Kind:            EventAlbumStarted,
+			AlbumName:       folderName,
+			AlbumIndex:      tui.globalAlbums + 1,
+			AlbumTotal:      totalAlbums,
+			AlbumFileCount:  len(files),
+			AlbumTotalBytes: totalBytes,
+		})
 
 		uploadedIDs := make([]string, 0, len(files))
 		uploadErrors := 0
@@ -632,12 +839,13 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 			size int64
 		}
 		type uploadResult struct {
-			idx   int
-			path  string
-			size  int64
-			asset assetUploadResponse
-			dur   time.Duration
-			err   error
+			idx     int
+			path    string
+			size    int64
+			asset   assetUploadResponse
+			dur     time.Duration
+			moveErr error
+			err     error
 		}
 
 		jobs := make(chan uploadJob)
@@ -679,17 +887,17 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 					fileStart := time.Now()
 					asset, err := c.uploadAsset(ctx, job.path, deviceID, deviceAssetID, created, modified, sum)
 					fileDur := time.Since(fileStart)
+					var moveErr error
 					if err == nil {
 						if merr := moveFileToIgnore(opt.Root, opt.IgnoreDir, folderName, folderPath, job.path); merr != nil {
 							eventf("move failed (%s): %v\n", job.path, merr)
-							if tuiEnabled {
-								tui.Lock()
-								tui.globalMovedFail++
-								tui.Unlock()
-							}
+							moveErr = merr
+						} else {
+							// Best effort: remove now-empty source directories up to album root.
+							pruneEmptyDirs(filepath.Dir(job.path), folderPath)
 						}
 					}
-					results <- uploadResult{idx: job.idx, path: job.path, size: job.size, asset: asset, dur: fileDur, err: err}
+					results <- uploadResult{idx: job.idx, path: job.path, size: job.size, asset: asset, dur: fileDur, moveErr: moveErr, err: err}
 				}
 			}()
 		}
@@ -709,52 +917,141 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 		}()
 
 		completed := 0
-		uploadedBytesMu := sync.Mutex{}
 		for res := range results {
 			completed++
+			processedBytes += res.size
 			if res.err != nil {
 				uploadErrors++
+				globalFailed++
 				eventf("upload failed (%s): %v\n", res.path, res.err)
+				emit(Event{
+					Kind:            EventFileFailed,
+					AlbumName:       folderName,
+					AlbumIndex:      tui.globalAlbums + 1,
+					AlbumTotal:      totalAlbums,
+					AlbumDone:       completed,
+					AlbumFileCount:  len(files),
+					AlbumBytes:      processedBytes,
+					AlbumTotalBytes: totalBytes,
+					FilePath:        res.path,
+					FileName:        filepath.Base(res.path),
+					Error:           res.err.Error(),
+					GlobalFiles:     globalFiles,
+					GlobalDup:       globalDup,
+					GlobalFailed:    globalFailed,
+					GlobalMovedFail: globalMovedFail,
+					GlobalBytes:     globalBytes,
+				})
 				if tuiEnabled {
 					tui.Lock()
-					tui.globalFailed++
+					tui.globalFailed = globalFailed
+					tui.albumDone = completed
+					tui.albumBytes = processedBytes
+					tui.albumLast = filepath.Base(res.path) + " (error)"
 					tui.Unlock()
+					clearAndPrint(renderLine())
 				}
 				continue
 			}
 			uploadedIDs = append(uploadedIDs, res.asset.ID)
+			globalFiles++
+			if strings.Contains(strings.ToLower(res.asset.Status), "duplicate") {
+				globalDup++
+			}
+			globalBytes += res.size
+			if res.moveErr != nil {
+				globalMovedFail++
+				emit(Event{
+					Kind:            EventMoveFailed,
+					AlbumName:       folderName,
+					AlbumIndex:      tui.globalAlbums + 1,
+					AlbumTotal:      totalAlbums,
+					AlbumDone:       completed,
+					AlbumFileCount:  len(files),
+					AlbumBytes:      processedBytes,
+					AlbumTotalBytes: totalBytes,
+					FilePath:        res.path,
+					FileName:        filepath.Base(res.path),
+					Error:           res.moveErr.Error(),
+					GlobalFiles:     globalFiles,
+					GlobalDup:       globalDup,
+					GlobalFailed:    globalFailed,
+					GlobalMovedFail: globalMovedFail,
+					GlobalBytes:     globalBytes,
+				})
+			}
+			emit(Event{
+				Kind:            EventFileUploaded,
+				AlbumName:       folderName,
+				AlbumIndex:      tui.globalAlbums + 1,
+				AlbumTotal:      totalAlbums,
+				AlbumDone:       completed,
+				AlbumFileCount:  len(files),
+				AlbumBytes:      processedBytes,
+				AlbumTotalBytes: totalBytes,
+				FilePath:        res.path,
+				FileName:        filepath.Base(res.path),
+				AssetID:         res.asset.ID,
+				AssetStatus:     res.asset.Status,
+				GlobalFiles:     globalFiles,
+				GlobalDup:       globalDup,
+				GlobalFailed:    globalFailed,
+				GlobalMovedFail: globalMovedFail,
+				GlobalBytes:     globalBytes,
+			})
 			if tuiEnabled {
 				tui.Lock()
-				tui.globalFiles++
-				if strings.Contains(strings.ToLower(res.asset.Status), "duplicate") {
-					tui.globalDup++
-				}
+				tui.globalFiles = globalFiles
+				tui.globalDup = globalDup
+				tui.globalMovedFail = globalMovedFail
+				tui.albumLast = filepath.Base(res.path) + " (" + res.asset.Status + ")"
 				tui.Unlock()
 			}
 
-			uploadedBytesMu.Lock()
-			uploadedBytes += res.size
 			elapsed := time.Since(albumStart)
 			if tuiEnabled {
 				tui.Lock()
 				tui.albumDone = completed
-				tui.albumBytes = uploadedBytes
-				tui.globalBytes = tui.globalBytes + res.size
+				tui.albumBytes = processedBytes
+				tui.globalBytes = globalBytes
 				tui.Unlock()
 				clearAndPrint(renderLine())
 			} else {
 				logf("    Progress: %d/%d (%s/%s) | avg %s | last %s (%s)\n",
-					completed, len(files), formatBytes(uploadedBytes), formatBytes(totalBytes), formatRate(uploadedBytes, elapsed), formatRate(res.size, res.dur), res.dur.Round(time.Millisecond))
+					completed, len(files), formatBytes(processedBytes), formatBytes(totalBytes), formatRate(processedBytes, elapsed), formatRate(res.size, res.dur), res.dur.Round(time.Millisecond))
 			}
 
 			if !tuiEnabled {
 				logf("  [%d/%d] %s -> %s (%s)\n", completed, len(files), filepath.Base(res.path), res.asset.ID, res.asset.Status)
 			}
-			uploadedBytesMu.Unlock()
 		}
 
 		if len(uploadedIDs) == 0 {
 			eventf("No uploads succeeded for %s\n", folderName)
+			emit(Event{
+				Kind:            EventAlbumFinished,
+				AlbumName:       folderName,
+				AlbumIndex:      tui.globalAlbums + 1,
+				AlbumTotal:      totalAlbums,
+				AlbumDone:       completed,
+				AlbumFileCount:  len(files),
+				AlbumBytes:      processedBytes,
+				AlbumTotalBytes: totalBytes,
+				Message:         "no uploads succeeded",
+				GlobalFiles:     globalFiles,
+				GlobalDup:       globalDup,
+				GlobalFailed:    globalFailed,
+				GlobalMovedFail: globalMovedFail,
+				GlobalBytes:     globalBytes,
+			})
+			if tuiEnabled {
+				tui.Lock()
+				tui.globalAlbums++
+				tui.albumName = ""
+				tui.albumLast = ""
+				tui.Unlock()
+				fmt.Fprint(os.Stdout, "\r")
+			}
 			continue
 		}
 
@@ -765,16 +1062,61 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 		for _, ch := range chunk(uploadedIDs, opt.BatchSize) {
 			if err := c.addAssetsToAlbum(ctx, albumID, ch); err != nil {
 				eventf("add assets to album %s failed: %v\n", folderName, err)
+				emit(Event{
+					Kind:            EventAlbumError,
+					AlbumName:       folderName,
+					AlbumIndex:      tui.globalAlbums + 1,
+					AlbumTotal:      totalAlbums,
+					AlbumDone:       completed,
+					AlbumFileCount:  len(files),
+					AlbumBytes:      processedBytes,
+					AlbumTotalBytes: totalBytes,
+					Error:           err.Error(),
+					Message:         "add assets to album failed",
+					GlobalFiles:     globalFiles,
+					GlobalDup:       globalDup,
+					GlobalFailed:    globalFailed,
+					GlobalMovedFail: globalMovedFail,
+					GlobalBytes:     globalBytes,
+				})
 			}
 		}
 		eventf("Album %s: added %d assets\n", folderName, len(uploadedIDs))
+		emit(Event{
+			Kind:            EventAlbumFinished,
+			AlbumName:       folderName,
+			AlbumIndex:      tui.globalAlbums + 1,
+			AlbumTotal:      totalAlbums,
+			AlbumDone:       completed,
+			AlbumFileCount:  len(files),
+			AlbumBytes:      processedBytes,
+			AlbumTotalBytes: totalBytes,
+			Message:         fmt.Sprintf("added %d assets", len(uploadedIDs)),
+			GlobalFiles:     globalFiles,
+			GlobalDup:       globalDup,
+			GlobalFailed:    globalFailed,
+			GlobalMovedFail: globalMovedFail,
+			GlobalBytes:     globalBytes,
+		})
 		if tuiEnabled {
 			tui.Lock()
+			tui.globalAlbums++
 			tui.albumName = ""
+			tui.albumLast = ""
 			tui.Unlock()
 			fmt.Fprint(os.Stdout, "\r")
 		}
 	}
+
+	emit(Event{
+		Kind:            EventRunCompleted,
+		AlbumTotal:      totalAlbums,
+		GlobalFiles:     globalFiles,
+		GlobalDup:       globalDup,
+		GlobalFailed:    globalFailed,
+		GlobalMovedFail: globalMovedFail,
+		GlobalBytes:     globalBytes,
+	})
 
 	return nil
 }
