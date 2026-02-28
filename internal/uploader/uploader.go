@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -42,6 +43,11 @@ type createAlbumRequest struct {
 type assetUploadResponse struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
+}
+
+type assetInfoResponse struct {
+	ID       string `json:"id"`
+	Checksum string `json:"checksum"` // Base64 encoded SHA1
 }
 
 type bulkIDs struct {
@@ -119,6 +125,15 @@ func (c *client) addAssetsToAlbum(ctx context.Context, albumID string, assetIDs 
 	}
 	path := fmt.Sprintf("/albums/%s/assets", albumID)
 	return c.doJSON(ctx, http.MethodPut, path, bulkIDs{IDs: assetIDs}, nil)
+}
+
+func (c *client) getAssetInfo(ctx context.Context, assetID string) (assetInfoResponse, error) {
+	var out assetInfoResponse
+	path := fmt.Sprintf("/assets/%s", assetID)
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return assetInfoResponse{}, err
+	}
+	return out, nil
 }
 
 func (c *client) uploadAsset(ctx context.Context, filePath, deviceID, deviceAssetID string, createdAt, modifiedAt time.Time, checksumSHA1 string) (assetUploadResponse, error) {
@@ -209,6 +224,17 @@ func (c *client) uploadAsset(ctx context.Context, filePath, deviceID, deviceAsse
 func sha1HexString(s string) string {
 	h := sha1.Sum([]byte(s))
 	return hex.EncodeToString(h[:])
+}
+
+func hexSHA1ToBase64(hexChecksum string) (string, error) {
+	raw, err := hex.DecodeString(strings.TrimSpace(hexChecksum))
+	if err != nil {
+		return "", err
+	}
+	if len(raw) != sha1.Size {
+		return "", fmt.Errorf("invalid sha1 length: %d", len(raw))
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
 func sha1File(path string) (string, error) {
@@ -434,11 +460,14 @@ type Options struct {
 	// DedupeAdd: if true, rely on server-side checksum dedupe during upload.
 	// (Future: add /assets/bulk-upload-check preflight.)
 	DedupeAdd bool
-	TUI       bool
-	TUIAuto   bool
-	TUIStyle  string
-	NoANSI    bool
-	OnEvent   EventFunc
+	// DeleteOnSuccess permanently deletes local files after upload and
+	// checksum verification against the uploaded asset metadata.
+	DeleteOnSuccess bool
+	TUI             bool
+	TUIAuto         bool
+	TUIStyle        string
+	NoANSI          bool
+	OnEvent         EventFunc
 }
 
 type Logf func(format string, args ...any)
@@ -721,17 +750,19 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 			eventf("Using existing album: %s\n", folderName)
 		}
 
-		if _, err := ensureIgnoreAlbumDir(opt.Root, opt.IgnoreDir, folderName); err != nil {
-			eventf("failed to create ignore folder for %s: %v\n", folderName, err)
-			emit(Event{
-				Kind:       EventAlbumError,
-				AlbumName:  folderName,
-				AlbumIndex: tui.globalAlbums + 1,
-				AlbumTotal: totalAlbums,
-				Error:      err.Error(),
-				Message:    "failed to create ignore folder",
-			})
-			continue
+		if !opt.DeleteOnSuccess {
+			if _, err := ensureIgnoreAlbumDir(opt.Root, opt.IgnoreDir, folderName); err != nil {
+				eventf("failed to create ignore folder for %s: %v\n", folderName, err)
+				emit(Event{
+					Kind:       EventAlbumError,
+					AlbumName:  folderName,
+					AlbumIndex: tui.globalAlbums + 1,
+					AlbumTotal: totalAlbums,
+					Error:      err.Error(),
+					Message:    "failed to create ignore folder",
+				})
+				continue
+			}
 		}
 
 		var files []string
@@ -877,10 +908,14 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 					modified := st.ModTime()
 
 					sum := ""
-					if opt.Checksum {
+					localSHA1Hex := ""
+					if opt.Checksum || opt.DeleteOnSuccess {
 						s, err := sha1File(job.path)
 						if err == nil {
-							sum = s
+							localSHA1Hex = s
+							if opt.Checksum {
+								sum = s
+							}
 						}
 					}
 
@@ -889,12 +924,38 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 					fileDur := time.Since(fileStart)
 					var moveErr error
 					if err == nil {
-						if merr := moveFileToIgnore(opt.Root, opt.IgnoreDir, folderName, folderPath, job.path); merr != nil {
-							eventf("move failed (%s): %v\n", job.path, merr)
-							moveErr = merr
+						if opt.DeleteOnSuccess {
+							if localSHA1Hex == "" {
+								moveErr = fmt.Errorf("delete skipped: local checksum unavailable")
+							} else {
+								assetInfo, gerr := c.getAssetInfo(ctx, asset.ID)
+								if gerr != nil {
+									moveErr = fmt.Errorf("delete skipped: fetch uploaded asset failed: %w", gerr)
+								} else {
+									localB64, berr := hexSHA1ToBase64(localSHA1Hex)
+									if berr != nil {
+										moveErr = fmt.Errorf("delete skipped: local checksum conversion failed: %w", berr)
+									} else if assetInfo.Checksum != localB64 {
+										moveErr = fmt.Errorf("delete skipped: checksum mismatch (local=%s remote=%s)", localB64, assetInfo.Checksum)
+									} else if derr := os.Remove(job.path); derr != nil {
+										moveErr = derr
+									} else {
+										// Best effort: remove now-empty source directories up to album root.
+										pruneEmptyDirs(filepath.Dir(job.path), folderPath)
+									}
+								}
+							}
+							if moveErr != nil {
+								eventf("delete failed (%s): %v\n", job.path, moveErr)
+							}
 						} else {
-							// Best effort: remove now-empty source directories up to album root.
-							pruneEmptyDirs(filepath.Dir(job.path), folderPath)
+							if merr := moveFileToIgnore(opt.Root, opt.IgnoreDir, folderName, folderPath, job.path); merr != nil {
+								eventf("move failed (%s): %v\n", job.path, merr)
+								moveErr = merr
+							} else {
+								// Best effort: remove now-empty source directories up to album root.
+								pruneEmptyDirs(filepath.Dir(job.path), folderPath)
+							}
 						}
 					}
 					results <- uploadResult{idx: job.idx, path: job.path, size: job.size, asset: asset, dur: fileDur, moveErr: moveErr, err: err}

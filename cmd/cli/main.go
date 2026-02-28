@@ -21,6 +21,7 @@ func main() {
 		workers       = flag.Int("workers", 4, "Number of parallel upload workers per album")
 		smallestFirst = flag.Bool("smallest-first", true, "Upload smaller files first")
 		dedupeAdd     = flag.Bool("dedupe-add", true, "If true, rely on checksum dedupe so existing assets can still be added to the album")
+		deleteSuccess = flag.Bool("delete-on-success", false, "If true, verify uploaded checksum and permanently delete local files on success")
 		timeout       = flag.Duration("timeout", 5*time.Minute, "HTTP timeout")
 		ignoreDir     = flag.String("ignore-dir", "ignore", "Folder name to ignore (and destination for moved folders)")
 		tui           = flag.Bool("tui", false, "Enable single-line TUI status display")
@@ -31,21 +32,22 @@ func main() {
 	flag.Parse()
 
 	opt := uploader.Options{
-		BaseURL:       *baseURL,
-		APIKey:        *apiKey,
-		Root:          *root,
-		Deep:          *deep,
-		Checksum:      *checksum,
-		BatchSize:     *batchSize,
-		Workers:       *workers,
-		SmallestFirst: *smallestFirst,
-		IgnoreDir:     *ignoreDir,
-		Timeout:       *timeout,
-		DedupeAdd:     *dedupeAdd,
-		TUI:           *tui,
-		TUIAuto:       *tuiAuto,
-		TUIStyle:      *tuiStyle,
-		NoANSI:        *noANSI,
+		BaseURL:         *baseURL,
+		APIKey:          *apiKey,
+		Root:            *root,
+		Deep:            *deep,
+		Checksum:        *checksum,
+		BatchSize:       *batchSize,
+		Workers:         *workers,
+		SmallestFirst:   *smallestFirst,
+		IgnoreDir:       *ignoreDir,
+		Timeout:         *timeout,
+		DedupeAdd:       *dedupeAdd,
+		DeleteOnSuccess: *deleteSuccess,
+		TUI:             *tui,
+		TUIAuto:         *tuiAuto,
+		TUIStyle:        *tuiStyle,
+		NoANSI:          *noANSI,
 	}
 
 	if err := uploader.Run(context.Background(), opt, func(format string, args ...any) {

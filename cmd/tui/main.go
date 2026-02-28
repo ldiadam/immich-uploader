@@ -31,32 +31,34 @@ const (
 )
 
 type appConfig struct {
-	BaseURL       string `json:"base_url"`
-	APIKey        string `json:"api_key"`
-	Root          string `json:"root"`
-	Deep          bool   `json:"deep"`
-	Checksum      bool   `json:"checksum"`
-	BatchSize     int    `json:"batch_size"`
-	Workers       int    `json:"workers"`
-	SmallestFirst bool   `json:"smallest_first"`
-	DedupeAdd     bool   `json:"dedupe_add"`
-	IgnoreDir     string `json:"ignore_dir"`
-	Timeout       string `json:"timeout"`
+	BaseURL         string `json:"base_url"`
+	APIKey          string `json:"api_key"`
+	Root            string `json:"root"`
+	Deep            bool   `json:"deep"`
+	Checksum        bool   `json:"checksum"`
+	BatchSize       int    `json:"batch_size"`
+	Workers         int    `json:"workers"`
+	SmallestFirst   bool   `json:"smallest_first"`
+	DedupeAdd       bool   `json:"dedupe_add"`
+	DeleteOnSuccess bool   `json:"delete_on_success"`
+	IgnoreDir       string `json:"ignore_dir"`
+	Timeout         string `json:"timeout"`
 }
 
 func defaultConfig() appConfig {
 	return appConfig{
-		BaseURL:       "http://localhost:2283/api",
-		APIKey:        "",
-		Root:          ".",
-		Deep:          true,
-		Checksum:      true,
-		BatchSize:     200,
-		Workers:       4,
-		SmallestFirst: true,
-		DedupeAdd:     true,
-		IgnoreDir:     "ignore",
-		Timeout:       (5 * time.Hour).String(),
+		BaseURL:         "http://localhost:2283/api",
+		APIKey:          "",
+		Root:            ".",
+		Deep:            true,
+		Checksum:        true,
+		BatchSize:       200,
+		Workers:         4,
+		SmallestFirst:   true,
+		DedupeAdd:       true,
+		DeleteOnSuccess: false,
+		IgnoreDir:       "ignore",
+		Timeout:         (5 * time.Hour).String(),
 	}
 }
 
@@ -195,21 +197,22 @@ func buildOptions(cfg appConfig, onEvent uploader.EventFunc) uploader.Options {
 		timeout = d
 	}
 	return uploader.Options{
-		BaseURL:       cfg.BaseURL,
-		APIKey:        cfg.APIKey,
-		Root:          cfg.Root,
-		Deep:          cfg.Deep,
-		Checksum:      cfg.Checksum,
-		BatchSize:     cfg.BatchSize,
-		Workers:       cfg.Workers,
-		SmallestFirst: cfg.SmallestFirst,
-		IgnoreDir:     cfg.IgnoreDir,
-		Timeout:       timeout,
-		DedupeAdd:     cfg.DedupeAdd,
-		TUI:           false,
-		TUIAuto:       false,
-		NoANSI:        false,
-		OnEvent:       onEvent,
+		BaseURL:         cfg.BaseURL,
+		APIKey:          cfg.APIKey,
+		Root:            cfg.Root,
+		Deep:            cfg.Deep,
+		Checksum:        cfg.Checksum,
+		BatchSize:       cfg.BatchSize,
+		Workers:         cfg.Workers,
+		SmallestFirst:   cfg.SmallestFirst,
+		IgnoreDir:       cfg.IgnoreDir,
+		Timeout:         timeout,
+		DedupeAdd:       cfg.DedupeAdd,
+		DeleteOnSuccess: cfg.DeleteOnSuccess,
+		TUI:             false,
+		TUIAuto:         false,
+		NoANSI:          false,
+		OnEvent:         onEvent,
 	}
 }
 
@@ -225,7 +228,8 @@ func (m model) startRun() (model, tea.Cmd) {
 	cfg.Checksum = isTruthy(m.wizardInputs[7].Value())
 	cfg.SmallestFirst = isTruthy(m.wizardInputs[8].Value())
 	cfg.DedupeAdd = isTruthy(m.wizardInputs[9].Value())
-	cfg.IgnoreDir = strings.TrimSpace(m.wizardInputs[10].Value())
+	cfg.DeleteOnSuccess = isTruthy(m.wizardInputs[10].Value())
+	cfg.IgnoreDir = strings.TrimSpace(m.wizardInputs[11].Value())
 
 	if cfg.BaseURL == "" || cfg.APIKey == "" || cfg.Root == "" {
 		m.wizardErr = "Immich URL, API key, and root folder are required"
@@ -465,7 +469,7 @@ func (m model) wizardView() string {
 
 	labels := []string{
 		"Immich URL", "API Key", "Root Folder", "Workers", "Batch Size", "Timeout",
-		"Deep", "Checksum", "Smallest First", "Dedupe Add", "Ignore Dir",
+		"Deep", "Checksum", "Smallest First", "Dedupe Add", "Delete On Success", "Ignore Dir",
 	}
 	lines := make([]string, 0, len(m.wizardInputs))
 	for i := range m.wizardInputs {
@@ -590,6 +594,7 @@ func buildWizardInputs(cfg appConfig) []textinput.Model {
 		{fmt.Sprintf("%t", cfg.Checksum), false},
 		{fmt.Sprintf("%t", cfg.SmallestFirst), false},
 		{fmt.Sprintf("%t", cfg.DedupeAdd), false},
+		{fmt.Sprintf("%t", cfg.DeleteOnSuccess), false},
 		{cfg.IgnoreDir, false},
 	}
 	inputs := make([]textinput.Model, 0, len(vals))
@@ -634,6 +639,7 @@ func main() {
 		workers       = flag.Int("workers", cfg.Workers, "Number of parallel upload workers per album")
 		smallestFirst = flag.Bool("smallest-first", cfg.SmallestFirst, "Upload smaller files first")
 		dedupeAdd     = flag.Bool("dedupe-add", cfg.DedupeAdd, "If true, rely on checksum dedupe so existing assets can still be added to the album")
+		deleteSuccess = flag.Bool("delete-on-success", cfg.DeleteOnSuccess, "If true, verify uploaded checksum and permanently delete local files on success")
 		timeout       = flag.String("timeout", cfg.Timeout, "HTTP timeout duration (example: 5m, 90s)")
 		ignoreDir     = flag.String("ignore-dir", cfg.IgnoreDir, "Folder name to ignore (and destination for moved folders)")
 	)
@@ -648,6 +654,7 @@ func main() {
 	cfg.Workers = *workers
 	cfg.SmallestFirst = *smallestFirst
 	cfg.DedupeAdd = *dedupeAdd
+	cfg.DeleteOnSuccess = *deleteSuccess
 	cfg.Timeout = strings.TrimSpace(*timeout)
 	cfg.IgnoreDir = strings.TrimSpace(*ignoreDir)
 

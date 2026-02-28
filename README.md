@@ -61,6 +61,7 @@ Wizard keys:
 - `--deep`: if true (default), uploads nested subfolders too
 - `--checksum`: if true (default), computes sha1 of each file and sends `x-immich-checksum` (slower but better duplicate detection)
 - `--batch`: how many uploaded assets to add per album request
+- `--delete-on-success`: if true, verifies uploaded asset checksum via API and permanently deletes local source file on match
 
 ## Notes
 - Uses file `mtime` for both `fileCreatedAt` and `fileModifiedAt`.
@@ -68,6 +69,7 @@ Wizard keys:
 - If an album with the same name already exists, it reuses it.
 - An `ignore/<AlbumName>/` folder is created as soon as the album is processed.
 - Each file is moved into `ignore/<AlbumName>/...` immediately after its upload succeeds (preserving subfolder structure).
+- If `--delete-on-success=true`, files are deleted instead of moved, but only after checksum verification against Immich metadata.
 
 ## API endpoints used
 - `GET /albums`
