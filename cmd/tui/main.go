@@ -130,6 +130,7 @@ type model struct {
 	wizardErr    string
 
 	albumName       string
+	albumStart      time.Time
 	albumIndex      int
 	albumTotal      int
 	albumDone       int
@@ -362,6 +363,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.running = true
 			m.lastEvent = fmt.Sprintf("Starting upload (%d albums)", ev.AlbumTotal)
 		case uploader.EventAlbumStarted:
+			m.albumStart = ev.Time
 			m.lastEvent = fmt.Sprintf("Album %d/%d: %s", ev.AlbumIndex, ev.AlbumTotal, ev.AlbumName)
 		case uploader.EventFileUploaded:
 			base := ev.FileName
@@ -461,6 +463,14 @@ func formatBytes(n int64) string {
 	}
 }
 
+func formatMBps(bytes int64, d time.Duration) string {
+	if bytes <= 0 || d <= 0 {
+		return "0.00 MB/s"
+	}
+	mb := float64(bytes) / (1024.0 * 1024.0)
+	return fmt.Sprintf("%.2f MB/s", mb/d.Seconds())
+}
+
 func (m model) wizardView() string {
 	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("45"))
 	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
@@ -520,10 +530,15 @@ func (m model) runningView() string {
 
 	pFiles := ratio(m.albumDone, m.albumFiles)
 	pBytes := ratioBytes(m.albumBytes, m.albumTotalBytes)
+	albumElapsed := time.Since(m.albumStart)
+	if m.albumStart.IsZero() {
+		albumElapsed = 0
+	}
 	albumCard := card.Render(strings.Join([]string{
 		fmt.Sprintf("Album %d/%d: %s", m.albumIndex, m.albumTotal, m.albumName),
 		fmt.Sprintf("Files: %d/%d %s", m.albumDone, m.albumFiles, bar(26, pFiles)),
 		fmt.Sprintf("Bytes: %s / %s %s", formatBytes(m.albumBytes), formatBytes(m.albumTotalBytes), bar(26, pBytes)),
+		fmt.Sprintf("Album speed: %s", formatMBps(m.albumBytes, albumElapsed)),
 		"Last: " + m.lastEvent,
 	}, "\n"))
 
@@ -533,6 +548,7 @@ func (m model) runningView() string {
 		fmt.Sprintf("failed %d", m.globalFailed),
 		fmt.Sprintf("move-failed %d", m.globalMovedFail),
 		fmt.Sprintf("bytes %s", formatBytes(m.globalBytes)),
+		fmt.Sprintf("global speed %s", formatMBps(m.globalBytes, elapsed)),
 	}
 	statsCard := card.Render("Global\n" + strings.Join(stats, "\n"))
 
