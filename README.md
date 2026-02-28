@@ -17,6 +17,17 @@ go build -o immich-uploader ./cmd/cli
 go build -o immich-uploader-tui ./cmd/tui
 ```
 
+## Linux PATH setup
+
+```bash
+./scripts/install-linux-path.sh
+```
+
+This script:
+- ensures a user bin folder exists (`~/.local/bin` by default),
+- adds it to shell startup files (`~/.bashrc`, `~/.zshrc`, or `~/.profile`),
+- installs `immich-uploader` and `immich-uploader-tui` there (if built).
+
 ## Run
 
 ```bash
@@ -44,11 +55,16 @@ Wizard + saved config:
 - On first run (or with `--wizard`), TUI opens a setup wizard.
 - Wizard saves config to `~/.config/immich-uploader/tui-config.json` by default.
 - Use `--config /path/to/file.json` to use a custom config file.
-- After config exists, you can run with no upload flags:
+- After config exists, app opens a ready screen first (it does not auto-start upload):
 
 ```bash
 ./immich-uploader-tui
 ```
+
+Ready screen keys:
+- `s`: start upload
+- `w`: open wizard
+- `q`: quit
 
 Wizard keys:
 - `Tab` / `Shift+Tab`: move fields

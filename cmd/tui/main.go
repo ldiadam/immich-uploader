@@ -27,6 +27,7 @@ type uiMode string
 
 const (
 	modeWizard  uiMode = "wizard"
+	modeReady   uiMode = "ready"
 	modeRunning uiMode = "running"
 )
 
@@ -217,21 +218,7 @@ func buildOptions(cfg appConfig, onEvent uploader.EventFunc) uploader.Options {
 	}
 }
 
-func (m model) startRun() (model, tea.Cmd) {
-	cfg := m.cfg
-	cfg.BaseURL = strings.TrimSpace(m.wizardInputs[0].Value())
-	cfg.APIKey = strings.TrimSpace(m.wizardInputs[1].Value())
-	cfg.Root = strings.TrimSpace(m.wizardInputs[2].Value())
-	cfg.Workers = maxInt(1, mustAtoiDefault(strings.TrimSpace(m.wizardInputs[3].Value()), cfg.Workers))
-	cfg.BatchSize = maxInt(1, mustAtoiDefault(strings.TrimSpace(m.wizardInputs[4].Value()), cfg.BatchSize))
-	cfg.Timeout = strings.TrimSpace(m.wizardInputs[5].Value())
-	cfg.Deep = isTruthy(m.wizardInputs[6].Value())
-	cfg.Checksum = isTruthy(m.wizardInputs[7].Value())
-	cfg.SmallestFirst = isTruthy(m.wizardInputs[8].Value())
-	cfg.DedupeAdd = isTruthy(m.wizardInputs[9].Value())
-	cfg.DeleteOnSuccess = isTruthy(m.wizardInputs[10].Value())
-	cfg.IgnoreDir = strings.TrimSpace(m.wizardInputs[11].Value())
-
+func (m model) startRunWithConfig(cfg appConfig) (model, tea.Cmd) {
 	if cfg.BaseURL == "" || cfg.APIKey == "" || cfg.Root == "" {
 		m.wizardErr = "Immich URL, API key, and root folder are required"
 		return m, nil
@@ -283,6 +270,27 @@ func (m model) startRun() (model, tea.Cmd) {
 	return m, tea.Batch(listenEvent(m.events), waitDone(m.done), tickCmd())
 }
 
+func (m model) startRunFromWizard() (model, tea.Cmd) {
+	cfg := m.cfg
+	cfg.BaseURL = strings.TrimSpace(m.wizardInputs[0].Value())
+	cfg.APIKey = strings.TrimSpace(m.wizardInputs[1].Value())
+	cfg.Root = strings.TrimSpace(m.wizardInputs[2].Value())
+	cfg.Workers = maxInt(1, mustAtoiDefault(strings.TrimSpace(m.wizardInputs[3].Value()), cfg.Workers))
+	cfg.BatchSize = maxInt(1, mustAtoiDefault(strings.TrimSpace(m.wizardInputs[4].Value()), cfg.BatchSize))
+	cfg.Timeout = strings.TrimSpace(m.wizardInputs[5].Value())
+	cfg.Deep = isTruthy(m.wizardInputs[6].Value())
+	cfg.Checksum = isTruthy(m.wizardInputs[7].Value())
+	cfg.SmallestFirst = isTruthy(m.wizardInputs[8].Value())
+	cfg.DedupeAdd = isTruthy(m.wizardInputs[9].Value())
+	cfg.DeleteOnSuccess = isTruthy(m.wizardInputs[10].Value())
+	cfg.IgnoreDir = strings.TrimSpace(m.wizardInputs[11].Value())
+	return m.startRunWithConfig(cfg)
+}
+
+func (m model) startRunFromConfig() (model, tea.Cmd) {
+	return m.startRunWithConfig(m.cfg)
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -307,7 +315,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.wizardFocus = len(m.wizardInputs) - 1
 				}
 			case "ctrl+s":
-				return m.startRun()
+				return m.startRunFromWizard()
 			}
 			for i := range m.wizardInputs {
 				if i == m.wizardFocus {
@@ -321,6 +329,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		if m.mode == modeReady {
+			switch msg.String() {
+			case "ctrl+c", "q":
+				return m, tea.Quit
+			case "s":
+				return m.startRunFromConfig()
+			case "w":
+				m.mode = modeWizard
+				m.wizardInputs = buildWizardInputs(m.cfg)
+				m.wizardFocus = 0
+				m.wizardErr = ""
+				return m, nil
+			}
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			if m.running && m.cancel != nil {
@@ -330,6 +354,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "v":
 			m.verbose = !m.verbose
 			return m, nil
+		case "s":
+			if m.finished {
+				m.mode = modeReady
+				return m, nil
+			}
+		case "w":
+			if m.finished {
+				m.mode = modeWizard
+				m.wizardInputs = buildWizardInputs(m.cfg)
+				m.wizardFocus = 0
+				m.wizardErr = ""
+				return m, nil
+			}
 		}
 	case uploaderEventMsg:
 		ev := msg.ev
@@ -536,6 +573,35 @@ func (m model) wizardView() string {
 	return card.Render(strings.Join(content, "\n")) + "\n"
 }
 
+func (m model) readyView() string {
+	header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("27")).Padding(0, 1)
+	card := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("44")).
+		Background(lipgloss.Color("236")).
+		Padding(1, 2)
+	label := lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)
+	value := lipgloss.NewStyle().Foreground(lipgloss.Color("229"))
+	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	startBtn := statusChip(" [S] Start Upload ", lipgloss.Color("230"), lipgloss.Color("35"))
+	wizardBtn := statusChip(" [W] Open Wizard ", lipgloss.Color("230"), lipgloss.Color("62"))
+	quitBtn := statusChip(" [Q] Quit ", lipgloss.Color("230"), lipgloss.Color("160"))
+
+	lines := []string{
+		header.Render("Immich Uploader TUI"),
+		"",
+		fmt.Sprintf("%s %s", label.Render("Server:"), value.Render(m.cfg.BaseURL)),
+		fmt.Sprintf("%s %s", label.Render("Root:"), value.Render(m.cfg.Root)),
+		fmt.Sprintf("%s %s", label.Render("Workers:"), value.Render(strconv.Itoa(m.cfg.Workers))),
+		fmt.Sprintf("%s %s", label.Render("Delete On Success:"), value.Render(fmt.Sprintf("%t", m.cfg.DeleteOnSuccess))),
+		"",
+		startBtn + "  " + wizardBtn + "  " + quitBtn,
+		"",
+		hint.Render("Press S to start with current config, or W to edit settings."),
+	}
+	return card.Render(strings.Join(lines, "\n")) + "\n"
+}
+
 func (m model) runningView() string {
 	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("27")).Padding(0, 1)
 	okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("50"))
@@ -635,6 +701,9 @@ func (m model) runningView() string {
 func (m model) View() string {
 	if m.mode == modeWizard {
 		return m.wizardView()
+	}
+	if m.mode == modeReady {
+		return m.readyView()
 	}
 	return m.runningView()
 }
@@ -745,7 +814,7 @@ func main() {
 	}
 
 	if !*wizard {
-		m, _ = m.startRun()
+		m.mode = modeReady
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
