@@ -3,7 +3,6 @@ set -euo pipefail
 
 INSTALL_DIR="${HOME}/.local/bin"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CLI_SRC="${ROOT_DIR}/immich-uploader"
 TUI_SRC="${ROOT_DIR}/immich-uploader-tui"
 COPY_BINS=1
 
@@ -15,7 +14,6 @@ Set up a user-local PATH entry on Linux and optionally install binaries.
 
 Options:
   --install-dir <dir>   Target bin directory (default: ~/.local/bin)
-  --cli <path>          Path to CLI binary (default: ./immich-uploader)
   --tui <path>          Path to TUI binary (default: ./immich-uploader-tui)
   --no-copy             Only configure PATH; do not copy binaries
   -h, --help            Show this help
@@ -23,7 +21,7 @@ Options:
 Examples:
   ./scripts/install-linux-path.sh
   ./scripts/install-linux-path.sh --no-copy
-  ./scripts/install-linux-path.sh --cli ./bin/immich-uploader --tui ./bin/immich-uploader-tui
+  ./scripts/install-linux-path.sh --tui ./bin/immich-uploader-tui
 USAGE
 }
 
@@ -31,10 +29,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --install-dir)
       INSTALL_DIR="$2"
-      shift 2
-      ;;
-    --cli)
-      CLI_SRC="$2"
       shift 2
       ;;
     --tui)
@@ -86,16 +80,10 @@ if [[ ! -f "$HOME/.bashrc" && ! -f "$HOME/.zshrc" ]]; then
 fi
 
 if [[ "$COPY_BINS" -eq 1 ]]; then
-  if [[ -f "$CLI_SRC" ]]; then
-    install -m 0755 "$CLI_SRC" "$INSTALL_DIR/immich-uploader"
-    echo "Installed CLI -> $INSTALL_DIR/immich-uploader"
-  else
-    echo "CLI binary not found at: $CLI_SRC"
-    echo "Build it first: go build -o immich-uploader ./cmd/cli"
-  fi
-
   if [[ -f "$TUI_SRC" ]]; then
+    install -m 0755 "$TUI_SRC" "$INSTALL_DIR/immich-uploader"
     install -m 0755 "$TUI_SRC" "$INSTALL_DIR/immich-uploader-tui"
+    echo "Installed app -> $INSTALL_DIR/immich-uploader"
     echo "Installed TUI -> $INSTALL_DIR/immich-uploader-tui"
   else
     echo "TUI binary not found at: $TUI_SRC"

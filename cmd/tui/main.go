@@ -12,7 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -111,18 +116,64 @@ func argValue(name, fallback string) string {
 	return fallback
 }
 
+type keyMap struct {
+	Start      key.Binding
+	Wizard     key.Binding
+	Quit       key.Binding
+	ToggleLog  key.Binding
+	ToggleHelp key.Binding
+	Up         key.Binding
+	Down       key.Binding
+	PgUp       key.Binding
+	PgDown     key.Binding
+	Top        key.Binding
+	Bottom     key.Binding
+}
+
+func newKeyMap() keyMap {
+	return keyMap{
+		Start:      key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "start")),
+		Wizard:     key.NewBinding(key.WithKeys("w"), key.WithHelp("w", "wizard")),
+		Quit:       key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+		ToggleLog:  key.NewBinding(key.WithKeys("v"), key.WithHelp("v", "toggle logs")),
+		ToggleHelp: key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+		Up:         key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "log up")),
+		Down:       key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "log down")),
+		PgUp:       key.NewBinding(key.WithKeys("pgup", "u"), key.WithHelp("pgup/u", "page up")),
+		PgDown:     key.NewBinding(key.WithKeys("pgdown", "d"), key.WithHelp("pgdn/d", "page down")),
+		Top:        key.NewBinding(key.WithKeys("g"), key.WithHelp("g", "top")),
+		Bottom:     key.NewBinding(key.WithKeys("G"), key.WithHelp("G", "bottom")),
+	}
+}
+
+func (k keyMap) ShortHelp() []key.Binding {
+	return []key.Binding{k.Start, k.Wizard, k.ToggleLog, k.ToggleHelp, k.Quit}
+}
+
+func (k keyMap) FullHelp() [][]key.Binding {
+	return [][]key.Binding{
+		{k.Start, k.Wizard, k.ToggleLog, k.ToggleHelp, k.Quit},
+		{k.Up, k.Down, k.PgUp, k.PgDown, k.Top, k.Bottom},
+	}
+}
+
 type model struct {
-	start      time.Time
-	cancel     context.CancelFunc
-	events     <-chan uploader.Event
-	done       <-chan error
-	width      int
-	height     int
-	running    bool
-	finished   bool
-	err        error
-	mode       uiMode
-	verbose    bool
+	start    time.Time
+	cancel   context.CancelFunc
+	events   <-chan uploader.Event
+	done     <-chan error
+	width    int
+	height   int
+	running  bool
+	finished bool
+	err      error
+	mode     uiMode
+
+	verbose  bool
+	showHelp bool
+	keys     keyMap
+	help     help.Model
+
 	configPath string
 	cfg        appConfig
 
@@ -146,7 +197,11 @@ type model struct {
 	globalMovedFail int
 	globalBytes     int64
 
-	recent []string
+	eventLines []string
+	viewport   viewport.Model
+	spinner    spinner.Model
+	fileProg   progress.Model
+	byteProg   progress.Model
 }
 
 func listenEvent(events <-chan uploader.Event) tea.Cmd {
@@ -170,27 +225,38 @@ func waitDone(done <-chan error) tea.Cmd {
 }
 
 func tickCmd() tea.Cmd {
-	return tea.Tick(1*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func (m model) Init() tea.Cmd {
+	cmds := []tea.Cmd{m.spinner.Tick}
 	if m.running {
-		return tea.Batch(listenEvent(m.events), waitDone(m.done), tickCmd())
+		cmds = append(cmds, listenEvent(m.events), waitDone(m.done), tickCmd())
 	}
-	return nil
-}
-
-func (m model) appendEvent(s string) model {
-	m.recent = append(m.recent, s)
-	if len(m.recent) > 14 {
-		m.recent = m.recent[len(m.recent)-14:]
-	}
-	return m
+	return tea.Batch(cmds...)
 }
 
 func isTruthy(s string) bool {
 	s = strings.ToLower(strings.TrimSpace(s))
 	return s == "1" || s == "true" || s == "y" || s == "yes" || s == "on"
+}
+
+func mustAtoiDefault(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func buildOptions(cfg appConfig, onEvent uploader.EventFunc) uploader.Options {
@@ -228,7 +294,7 @@ func (m model) startRunWithConfig(cfg appConfig) (model, tea.Cmd) {
 		return m, nil
 	}
 	if _, err := time.ParseDuration(cfg.Timeout); err != nil {
-		m.wizardErr = "Timeout must be a valid duration (example: 5m, 90s)"
+		m.wizardErr = "Timeout must be valid (example: 5m, 90s)"
 		return m, nil
 	}
 
@@ -265,9 +331,12 @@ func (m model) startRunWithConfig(cfg appConfig) (model, tea.Cmd) {
 	m.start = time.Now()
 	m.wizardErr = ""
 	m.lastEvent = "Starting upload"
-	m.recent = nil
+	m.albumStart = time.Time{}
+	m.eventLines = nil
+	m.viewport.SetContent("")
+	m.viewport.GotoBottom()
 
-	return m, tea.Batch(listenEvent(m.events), waitDone(m.done), tickCmd())
+	return m, tea.Batch(listenEvent(m.events), waitDone(m.done), tickCmd(), m.spinner.Tick)
 }
 
 func (m model) startRunFromWizard() (model, tea.Cmd) {
@@ -291,30 +360,84 @@ func (m model) startRunFromConfig() (model, tea.Cmd) {
 	return m.startRunWithConfig(m.cfg)
 }
 
+func (m model) appendEvent(line string) model {
+	m.eventLines = append(m.eventLines, line)
+	if len(m.eventLines) > 600 {
+		m.eventLines = m.eventLines[len(m.eventLines)-600:]
+	}
+	m.viewport.SetContent(strings.Join(m.eventLines, "\n"))
+	m.viewport.GotoBottom()
+	return m
+}
+
+func (m model) updateProgressBars() {
+	f := ratio(m.albumDone, m.albumFiles)
+	b := ratioBytes(m.albumBytes, m.albumTotalBytes)
+	_ = m.fileProg.SetPercent(f)
+	_ = m.byteProg.SetPercent(b)
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		if m.width < 60 {
+			m.width = 60
+		}
+		vpW := m.width - 8
+		if vpW < 20 {
+			vpW = 20
+		}
+		vpH := 10
+		if m.height > 28 {
+			vpH = 12
+		}
+		m.viewport.Width = vpW
+		m.viewport.Height = vpH
+		m.viewport.SetContent(strings.Join(m.eventLines, "\n"))
+		m.viewport.GotoBottom()
+		m.fileProg.Width = 26
+		m.byteProg.Width = 26
 		return m, nil
 	case tickMsg:
 		if m.running {
 			return m, tickCmd()
 		}
 		return m, nil
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		cmds = append(cmds, cmd)
+	case tea.MouseMsg:
+		if m.mode == modeRunning && m.verbose {
+			switch {
+			case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonWheelUp:
+				m.viewport.LineUp(3)
+			case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonWheelDown:
+				m.viewport.LineDown(3)
+			}
+		}
 	case tea.KeyMsg:
+		if key.Matches(msg, m.keys.ToggleHelp) {
+			m.showHelp = !m.showHelp
+			return m, nil
+		}
+
 		if m.mode == modeWizard {
-			switch msg.String() {
-			case "ctrl+c", "q":
+			switch {
+			case key.Matches(msg, m.keys.Quit):
 				return m, tea.Quit
-			case "tab", "down", "enter":
+			case msg.String() == "tab" || msg.String() == "down" || msg.String() == "enter":
 				m.wizardFocus = (m.wizardFocus + 1) % len(m.wizardInputs)
-			case "shift+tab", "up":
+			case msg.String() == "shift+tab" || msg.String() == "up":
 				m.wizardFocus--
 				if m.wizardFocus < 0 {
 					m.wizardFocus = len(m.wizardInputs) - 1
 				}
-			case "ctrl+s":
+			case msg.String() == "ctrl+s":
 				return m.startRunFromWizard()
 			}
 			for i := range m.wizardInputs {
@@ -330,12 +453,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.mode == modeReady {
-			switch msg.String() {
-			case "ctrl+c", "q":
+			switch {
+			case key.Matches(msg, m.keys.Quit):
 				return m, tea.Quit
-			case "s":
+			case key.Matches(msg, m.keys.Start):
 				return m.startRunFromConfig()
-			case "w":
+			case key.Matches(msg, m.keys.Wizard):
 				m.mode = modeWizard
 				m.wizardInputs = buildWizardInputs(m.cfg)
 				m.wizardFocus = 0
@@ -345,27 +468,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		switch msg.String() {
-		case "ctrl+c", "q":
-			if m.running && m.cancel != nil {
-				m.cancel()
-			}
-			return m, tea.Quit
-		case "v":
-			m.verbose = !m.verbose
-			return m, nil
-		case "s":
-			if m.finished {
-				m.mode = modeReady
+		if m.mode == modeRunning {
+			switch {
+			case key.Matches(msg, m.keys.Quit):
+				if m.running && m.cancel != nil {
+					m.cancel()
+				}
+				return m, tea.Quit
+			case key.Matches(msg, m.keys.ToggleLog):
+				m.verbose = !m.verbose
 				return m, nil
+			case key.Matches(msg, m.keys.Wizard):
+				if m.finished {
+					m.mode = modeWizard
+					m.wizardInputs = buildWizardInputs(m.cfg)
+					m.wizardFocus = 0
+					m.wizardErr = ""
+					return m, nil
+				}
+			case key.Matches(msg, m.keys.Start):
+				if m.finished {
+					m.mode = modeReady
+					return m, nil
+				}
 			}
-		case "w":
-			if m.finished {
-				m.mode = modeWizard
-				m.wizardInputs = buildWizardInputs(m.cfg)
-				m.wizardFocus = 0
-				m.wizardErr = ""
-				return m, nil
+
+			if m.verbose {
+				switch {
+				case key.Matches(msg, m.keys.Up):
+					m.viewport.LineUp(1)
+				case key.Matches(msg, m.keys.Down):
+					m.viewport.LineDown(1)
+				case key.Matches(msg, m.keys.PgUp):
+					m.viewport.HalfViewUp()
+				case key.Matches(msg, m.keys.PgDown):
+					m.viewport.HalfViewDown()
+				case key.Matches(msg, m.keys.Top):
+					m.viewport.GotoTop()
+				case key.Matches(msg, m.keys.Bottom):
+					m.viewport.GotoBottom()
+				}
 			}
 		}
 	case uploaderEventMsg:
@@ -411,7 +553,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case uploader.EventFileFailed:
 			m.lastEvent = fmt.Sprintf("Failed %s", ev.FileName)
 		case uploader.EventMoveFailed:
-			m.lastEvent = fmt.Sprintf("Move failed %s", ev.FileName)
+			m.lastEvent = fmt.Sprintf("Post-upload action failed %s", ev.FileName)
 		case uploader.EventAlbumSkipped:
 			m.lastEvent = fmt.Sprintf("Skipped album %s", ev.AlbumName)
 		case uploader.EventAlbumError:
@@ -422,12 +564,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastEvent = "Upload completed"
 		}
 
-		line := string(ev.Kind) + " | " + m.lastEvent
+		m.updateProgressBars()
+		line := fmt.Sprintf("%s | %s", string(ev.Kind), m.lastEvent)
 		if ev.Error != "" {
 			line += " | " + ev.Error
 		}
 		m = m.appendEvent(line)
-		return m, listenEvent(m.events)
+		cmds = append(cmds, listenEvent(m.events))
 	case uploaderDoneMsg:
 		m.running = false
 		m.finished = true
@@ -438,9 +581,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.lastEvent = "Upload finished"
 		}
-		return m, nil
 	}
-	return m, nil
+
+	return m, tea.Batch(cmds...)
 }
 
 func ratio(done, total int) float64 {
@@ -471,17 +614,6 @@ func ratioBytes(done, total int64) float64 {
 	return r
 }
 
-func bar(width int, r float64) string {
-	if width < 10 {
-		width = 10
-	}
-	fill := int(float64(width) * r)
-	if fill > width {
-		fill = width
-	}
-	return "[" + strings.Repeat("█", fill) + strings.Repeat("░", width-fill) + "]"
-}
-
 func formatBytes(n int64) string {
 	const (
 		KB = 1024
@@ -508,22 +640,6 @@ func formatMBps(bytes int64, d time.Duration) string {
 	return fmt.Sprintf("%.2f MB/s", mb/d.Seconds())
 }
 
-func colorBar(width int, r float64, fill, empty lipgloss.Color) string {
-	if width < 10 {
-		width = 10
-	}
-	fillN := int(float64(width) * r)
-	if fillN > width {
-		fillN = width
-	}
-	if fillN < 0 {
-		fillN = 0
-	}
-	fillStyle := lipgloss.NewStyle().Foreground(fill)
-	emptyStyle := lipgloss.NewStyle().Foreground(empty)
-	return "[" + fillStyle.Render(strings.Repeat("█", fillN)) + emptyStyle.Render(strings.Repeat("░", width-fillN)) + "]"
-}
-
 func statusChip(text string, fg, bg lipgloss.Color) string {
 	return lipgloss.NewStyle().
 		Foreground(fg).
@@ -548,6 +664,7 @@ func (m model) wizardView() string {
 		"Immich URL", "API Key", "Root Folder", "Workers", "Batch Size", "Timeout",
 		"Deep", "Checksum", "Smallest First", "Dedupe Add", "Delete On Success", "Ignore Dir",
 	}
+
 	lines := make([]string, 0, len(m.wizardInputs))
 	for i := range m.wizardInputs {
 		prefix := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("  ")
@@ -565,7 +682,7 @@ func (m model) wizardView() string {
 		"",
 		strings.Join(lines, "\n"),
 		"",
-		muted.Render("Tab/Shift+Tab to move, type to edit, Ctrl+S to save and start, q to quit"),
+		muted.Render("Tab/Shift+Tab move | type edit | Ctrl+S save+start | q quit"),
 	}
 	if m.wizardErr != "" {
 		content = append(content, errStyle.Render(m.wizardErr))
@@ -605,7 +722,6 @@ func (m model) readyView() string {
 func (m model) runningView() string {
 	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("27")).Padding(0, 1)
 	okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("50"))
-	warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	card := lipgloss.NewStyle().
@@ -625,26 +741,27 @@ func (m model) runningView() string {
 		statusChipView = statusChip(status, lipgloss.Color("230"), lipgloss.Color("28"))
 	}
 	if m.err != nil {
-		status = "ERROR"
-		statusChipView = statusChip(status, lipgloss.Color("230"), lipgloss.Color("160"))
+		statusChipView = statusChip("ERROR", lipgloss.Color("230"), lipgloss.Color("160"))
 	} else if m.globalFailed > 0 || m.globalMovedFail > 0 {
 		statusChipView = statusChip("WARN", lipgloss.Color("232"), lipgloss.Color("220"))
 	}
 
 	elapsed := time.Since(m.start).Round(time.Second)
-	title := headerStyle.Render("Immich Uploader TUI") + "  " + statusChipView
-	meta := muted.Render(fmt.Sprintf("elapsed %s | press q to quit | v toggle events", elapsed))
+	spin := m.spinner.View()
+	title := headerStyle.Render("Immich Uploader TUI") + "  " + statusChipView + "  " + lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Render(spin)
+	meta := muted.Render(fmt.Sprintf("elapsed %s | q quit | v logs | ? help | mouse wheel scroll", elapsed))
 
-	pFiles := ratio(m.albumDone, m.albumFiles)
-	pBytes := ratioBytes(m.albumBytes, m.albumTotalBytes)
 	albumElapsed := time.Since(m.albumStart)
 	if m.albumStart.IsZero() {
 		albumElapsed = 0
 	}
+	fileBar := m.fileProg.ViewAs(ratio(m.albumDone, m.albumFiles))
+	byteBar := m.byteProg.ViewAs(ratioBytes(m.albumBytes, m.albumTotalBytes))
+
 	albumCard := albumCardStyle.Render(strings.Join([]string{
 		label.Render(fmt.Sprintf("Album %d/%d", m.albumIndex, m.albumTotal)) + " " + lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Render(m.albumName),
-		fmt.Sprintf("%s %d/%d %s", label.Render("Files:"), m.albumDone, m.albumFiles, colorBar(26, pFiles, lipgloss.Color("44"), lipgloss.Color("238"))),
-		fmt.Sprintf("%s %s / %s %s", label.Render("Bytes:"), formatBytes(m.albumBytes), formatBytes(m.albumTotalBytes), colorBar(26, pBytes, lipgloss.Color("50"), lipgloss.Color("238"))),
+		fmt.Sprintf("%s %d/%d %s", label.Render("Files:"), m.albumDone, m.albumFiles, fileBar),
+		fmt.Sprintf("%s %s / %s %s", label.Render("Bytes:"), formatBytes(m.albumBytes), formatBytes(m.albumTotalBytes), byteBar),
 		fmt.Sprintf("%s %s", label.Render("Album speed:"), okStyle.Render(formatMBps(m.albumBytes, albumElapsed))),
 		fmt.Sprintf("%s %s", label.Render("Last:"), lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Render(m.lastEvent)),
 	}, "\n"))
@@ -657,6 +774,7 @@ func (m model) runningView() string {
 	if m.globalDup > 0 {
 		dupColor = lipgloss.Color("220")
 	}
+
 	stats := []string{
 		fmt.Sprintf("%s %s", label.Render("uploaded"), lipgloss.NewStyle().Foreground(lipgloss.Color("50")).Render(fmt.Sprintf("%d", m.globalFiles))),
 		fmt.Sprintf("%s %s", label.Render("duplicates"), lipgloss.NewStyle().Foreground(dupColor).Render(fmt.Sprintf("%d", m.globalDup))),
@@ -667,63 +785,74 @@ func (m model) runningView() string {
 	}
 	statsCard := statsCardStyle.Render(label.Render("Global") + "\n" + strings.Join(stats, "\n"))
 
-	body := lipgloss.JoinHorizontal(lipgloss.Top, albumCard, "  ", statsCard)
+	body := ""
+	if m.width > 118 {
+		// Wide terminals: two-column dashboard.
+		leftW := (m.width - 8) * 2 / 3
+		rightW := (m.width - 8) - leftW
+		if leftW < 48 {
+			leftW = 48
+		}
+		if rightW < 24 {
+			rightW = 24
+		}
+		albumCard = albumCardStyle.Width(leftW).Render(strings.Join([]string{
+			label.Render(fmt.Sprintf("Album %d/%d", m.albumIndex, m.albumTotal)) + " " + lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Render(m.albumName),
+			fmt.Sprintf("%s %d/%d %s", label.Render("Files:"), m.albumDone, m.albumFiles, fileBar),
+			fmt.Sprintf("%s %s / %s %s", label.Render("Bytes:"), formatBytes(m.albumBytes), formatBytes(m.albumTotalBytes), byteBar),
+			fmt.Sprintf("%s %s", label.Render("Album speed:"), okStyle.Render(formatMBps(m.albumBytes, albumElapsed))),
+			fmt.Sprintf("%s %s", label.Render("Last:"), lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Render(m.lastEvent)),
+		}, "\n"))
+		statsCard = statsCardStyle.Width(rightW).Render(label.Render("Global") + "\n" + strings.Join(stats, "\n"))
+		body = lipgloss.JoinHorizontal(lipgloss.Top, albumCard, "  ", statsCard)
+	} else {
+		// Narrow terminals: stack panels for readability.
+		stackW := m.width - 6
+		if stackW < 40 {
+			stackW = 40
+		}
+		albumCard = albumCardStyle.Width(stackW).Render(strings.Join([]string{
+			label.Render(fmt.Sprintf("Album %d/%d", m.albumIndex, m.albumTotal)) + " " + lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Render(m.albumName),
+			fmt.Sprintf("%s %d/%d %s", label.Render("Files:"), m.albumDone, m.albumFiles, fileBar),
+			fmt.Sprintf("%s %s / %s %s", label.Render("Bytes:"), formatBytes(m.albumBytes), formatBytes(m.albumTotalBytes), byteBar),
+			fmt.Sprintf("%s %s", label.Render("Album speed:"), okStyle.Render(formatMBps(m.albumBytes, albumElapsed))),
+			fmt.Sprintf("%s %s", label.Render("Last:"), lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Render(m.lastEvent)),
+		}, "\n"))
+		statsCard = statsCardStyle.Width(stackW).Render(label.Render("Global") + "\n" + strings.Join(stats, "\n"))
+		body = lipgloss.JoinVertical(lipgloss.Left, albumCard, "", statsCard)
+	}
 	out := []string{title, meta, "", body}
 
 	if m.verbose {
-		evLines := make([]string, 0, len(m.recent))
-		for _, line := range m.recent {
-			style := lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
-			ll := strings.ToLower(line)
-			if strings.Contains(ll, "failed") || strings.Contains(ll, "error") {
-				style = errStyle
-			} else if strings.Contains(ll, "uploaded") || strings.Contains(ll, "completed") {
-				style = okStyle
-			} else if strings.Contains(ll, "duplicate") || strings.Contains(ll, "skipped") {
-				style = warnStyle
-			}
-			evLines = append(evLines, style.Render(line))
-		}
-		out = append(out, "", eventsCardStyle.Render(label.Render("Recent Events")+"\n"+strings.Join(evLines, "\n")))
+		out = append(out, "", eventsCardStyle.Render(label.Render("Recent Events")+"\n"+m.viewport.View()))
 	}
 
 	if m.finished {
 		if m.err != nil {
 			out = append(out, "", errStyle.Render("Run finished with error: "+m.err.Error()))
+			out = append(out, muted.Render("Press W for wizard or Q to quit."))
 		} else {
 			out = append(out, "", okStyle.Render("Run finished successfully."))
+			out = append(out, muted.Render("Press S to return to ready screen, or W to edit config."))
 		}
+	}
+
+	if m.showHelp {
+		out = append(out, "", m.help.View(m.keys))
 	}
 
 	return strings.Join(out, "\n") + "\n"
 }
 
 func (m model) View() string {
-	if m.mode == modeWizard {
+	switch m.mode {
+	case modeWizard:
 		return m.wizardView()
-	}
-	if m.mode == modeReady {
+	case modeReady:
 		return m.readyView()
+	default:
+		return m.runningView()
 	}
-	return m.runningView()
-}
-
-func mustAtoiDefault(s string, def int) int {
-	if s == "" {
-		return def
-	}
-	v, err := strconv.Atoi(s)
-	if err != nil {
-		return def
-	}
-	return v
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func buildWizardInputs(cfg appConfig) []textinput.Model {
@@ -777,18 +906,18 @@ func main() {
 		wizard     = flag.Bool("wizard", wizardDefault, "Open setup wizard before running")
 		verbose    = flag.Bool("verbose", true, "Show recent event log panel")
 
-		baseURL       = flag.String("immich", cfg.BaseURL, "Immich base API URL (include /api). Example: https://photos.example.com/api")
+		baseURL       = flag.String("immich", cfg.BaseURL, "Immich base API URL (include /api)")
 		apiKey        = flag.String("key", cfg.APIKey, "Immich API key (x-api-key)")
 		root          = flag.String("root", cfg.Root, "Root folder containing album folders")
-		deep          = flag.Bool("deep", cfg.Deep, "If true (default), upload files from nested subfolders under each album folder")
-		checksum      = flag.Bool("checksum", cfg.Checksum, "If true (default), compute sha1 checksum and send x-immich-checksum header")
-		batchSize     = flag.Int("batch", cfg.BatchSize, "How many uploaded assets to add to album per request")
-		workers       = flag.Int("workers", cfg.Workers, "Number of parallel upload workers per album")
+		deep          = flag.Bool("deep", cfg.Deep, "Upload nested subfolders")
+		checksum      = flag.Bool("checksum", cfg.Checksum, "Compute sha1 and send x-immich-checksum")
+		batchSize     = flag.Int("batch", cfg.BatchSize, "Assets per album add request")
+		workers       = flag.Int("workers", cfg.Workers, "Parallel upload workers per album")
 		smallestFirst = flag.Bool("smallest-first", cfg.SmallestFirst, "Upload smaller files first")
-		dedupeAdd     = flag.Bool("dedupe-add", cfg.DedupeAdd, "If true, rely on checksum dedupe so existing assets can still be added to the album")
-		deleteSuccess = flag.Bool("delete-on-success", cfg.DeleteOnSuccess, "If true, verify uploaded checksum and permanently delete local files on success")
-		timeout       = flag.String("timeout", cfg.Timeout, "HTTP timeout duration (example: 5m, 90s)")
-		ignoreDir     = flag.String("ignore-dir", cfg.IgnoreDir, "Folder name to ignore (and destination for moved folders)")
+		dedupeAdd     = flag.Bool("dedupe-add", cfg.DedupeAdd, "Allow duplicate detection/add")
+		deleteSuccess = flag.Bool("delete-on-success", cfg.DeleteOnSuccess, "Verify checksum and delete local file")
+		timeout       = flag.String("timeout", cfg.Timeout, "HTTP timeout (example: 5m, 90s)")
+		ignoreDir     = flag.String("ignore-dir", cfg.IgnoreDir, "Ignore folder name")
 	)
 	flag.Parse()
 
@@ -805,19 +934,41 @@ func main() {
 	cfg.Timeout = strings.TrimSpace(*timeout)
 	cfg.IgnoreDir = strings.TrimSpace(*ignoreDir)
 
+	spin := spinner.New()
+	spin.Spinner = spinner.Dot
+	spin.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
+
+	fileProg := progress.New(
+		progress.WithDefaultGradient(),
+		progress.WithoutPercentage(),
+	)
+	byteProg := progress.New(
+		progress.WithGradient("#6EE7B7", "#34D399"),
+		progress.WithoutPercentage(),
+	)
+	vp := viewport.New(80, 10)
+
 	m := model{
 		mode:         modeWizard,
 		verbose:      *verbose,
+		showHelp:     false,
+		keys:         newKeyMap(),
+		help:         help.New(),
 		configPath:   *configPath,
 		cfg:          cfg,
 		wizardInputs: buildWizardInputs(cfg),
+		spinner:      spin,
+		fileProg:     fileProg,
+		byteProg:     byteProg,
+		viewport:     vp,
 	}
+	m.help.ShowAll = false
 
 	if !*wizard {
 		m.mode = modeReady
 	}
 
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

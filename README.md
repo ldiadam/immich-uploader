@@ -1,20 +1,22 @@
-# immich-uploader (albums from folders)
+# immich-uploader (TUI)
 
-Simple Go program that:
-1) creates (or reuses) an Immich album for each **folder name** under a root directory, then
-2) uploads all media files in that folder, then
-3) adds uploaded assets to the album.
+Interactive Bubble Tea app to upload media folders into Immich albums.
+
+Behavior:
+1) creates (or reuses) an Immich album for each folder under root,
+2) uploads media files,
+3) adds uploaded assets to the album,
+4) either moves local files to `ignore/` or (optionally) verifies checksum then deletes.
 
 ## Requirements
 - Immich server reachable
-- An Immich **API key** (Settings → API Keys)
+- An Immich API key (Settings -> API Keys)
 - Go 1.23+
 
 ## Build
 
 ```bash
-go build -o immich-uploader ./cmd/cli
-go build -o immich-uploader-tui ./cmd/tui
+go build -o immich-uploader ./cmd/tui
 ```
 
 ## Linux PATH setup
@@ -24,9 +26,9 @@ go build -o immich-uploader-tui ./cmd/tui
 ```
 
 This script:
-- ensures a user bin folder exists (`~/.local/bin` by default),
-- adds it to shell startup files (`~/.bashrc`, `~/.zshrc`, or `~/.profile`),
-- installs `immich-uploader` and `immich-uploader-tui` there (if built).
+- ensures `~/.local/bin` exists,
+- adds it to shell startup files,
+- installs `immich-uploader` and `immich-uploader-tui` from the built TUI binary.
 
 ## Run
 
@@ -34,32 +36,12 @@ This script:
 ./immich-uploader \
   --immich "https://immich.example.com/api" \
   --key "YOUR_IMMICH_API_KEY" \
-  --root "/path/to/photos" \
-  --deep=true
-```
-
-Interactive TUI mode (Bubble Tea):
-
-```bash
-./immich-uploader-tui \
-  --immich "https://immich.example.com/api" \
-  --key "YOUR_IMMICH_API_KEY" \
   --root "/path/to/photos"
 ```
 
-TUI keys:
-- `q` / `Ctrl+C`: quit
-- `v`: toggle recent event panel
-
-Wizard + saved config:
-- On first run (or with `--wizard`), TUI opens a setup wizard.
-- Wizard saves config to `~/.config/immich-uploader/tui-config.json` by default.
-- Use `--config /path/to/file.json` to use a custom config file.
-- After config exists, app opens a ready screen first (it does not auto-start upload):
-
-```bash
-./immich-uploader-tui
-```
+## Startup flow
+- First run (or `--wizard`) opens setup wizard.
+- After config exists, app opens a ready screen (no auto-upload).
 
 Ready screen keys:
 - `s`: start upload
@@ -69,28 +51,37 @@ Ready screen keys:
 Wizard keys:
 - `Tab` / `Shift+Tab`: move fields
 - `Ctrl+S`: save config and start upload
+- `q`: quit
 
-### Flags
-- `--immich`: base API URL **including `/api`** (e.g. `http://localhost:2283/api`)
-- `--key`: Immich API key (sent as header `x-api-key`)
-- `--root`: root folder containing album folders
-- `--deep`: if true (default), uploads nested subfolders too
-- `--checksum`: if true (default), computes sha1 of each file and sends `x-immich-checksum` (slower but better duplicate detection)
-- `--batch`: how many uploaded assets to add per album request
-- `--delete-on-success`: if true, verifies uploaded asset checksum via API and permanently deletes local source file on match
+Running keys:
+- `q` / `Ctrl+C`: quit
+- `v`: toggle event log panel
+- `?`: toggle help
+- `j`/`k`, arrow keys, `pgup`/`pgdn`, `g`/`G`: scroll logs
+
+## Config file
+- Default: `~/.config/immich-uploader/tui-config.json`
+- Custom path: `--config /path/to/file.json`
+
+## Key flags
+- `--immich`: base API URL including `/api`
+- `--key`: Immich API key (`x-api-key`)
+- `--root`: root folder containing album folders (use `.` for current folder)
+- `--workers`: parallel upload workers per album
+- `--batch`: assets per album-add request
+- `--checksum`: send SHA1 checksum header on upload
+- `--delete-on-success`: verify uploaded checksum via API, then permanently delete local file
+- `--ignore-dir`: folder name to skip and move successful files into (when not deleting)
 
 ## Notes
 - Uses file `mtime` for both `fileCreatedAt` and `fileModifiedAt`.
 - Filters to common photo/video extensions.
-- If an album with the same name already exists, it reuses it.
-- An `ignore/<AlbumName>/` folder is created as soon as the album is processed.
-- Each file is moved into `ignore/<AlbumName>/...` immediately after its upload succeeds (preserving subfolder structure).
-- If `--delete-on-success=true`, files are deleted instead of moved, but only after checksum verification against Immich metadata.
+- If `--delete-on-success=true`, file is deleted only when local SHA1 matches asset checksum returned by Immich.
+- Empty directories are pruned after move/delete.
 
 ## API endpoints used
 - `GET /albums`
 - `POST /albums`
-- `POST /assets` (multipart upload)
+- `POST /assets`
+- `GET /assets/{id}` (checksum verification for delete mode)
 - `PUT /albums/{id}/assets`
-
-- `--ignore-dir`: folder name to skip at root and to move successfully uploaded folders into (default `ignore`).
