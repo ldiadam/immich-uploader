@@ -471,11 +471,41 @@ func formatMBps(bytes int64, d time.Duration) string {
 	return fmt.Sprintf("%.2f MB/s", mb/d.Seconds())
 }
 
+func colorBar(width int, r float64, fill, empty lipgloss.Color) string {
+	if width < 10 {
+		width = 10
+	}
+	fillN := int(float64(width) * r)
+	if fillN > width {
+		fillN = width
+	}
+	if fillN < 0 {
+		fillN = 0
+	}
+	fillStyle := lipgloss.NewStyle().Foreground(fill)
+	emptyStyle := lipgloss.NewStyle().Foreground(empty)
+	return "[" + fillStyle.Render(strings.Repeat("█", fillN)) + emptyStyle.Render(strings.Repeat("░", width-fillN)) + "]"
+}
+
+func statusChip(text string, fg, bg lipgloss.Color) string {
+	return lipgloss.NewStyle().
+		Foreground(fg).
+		Background(bg).
+		Bold(true).
+		Padding(0, 1).
+		Render(text)
+}
+
 func (m model) wizardView() string {
-	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("45"))
-	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	card := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(1, 2)
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("33")).Padding(0, 1)
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	label := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
+	errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("160")).Padding(0, 1)
+	card := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("39")).
+		Background(lipgloss.Color("235")).
+		Padding(1, 2)
 
 	labels := []string{
 		"Immich URL", "API Key", "Root Folder", "Workers", "Batch Size", "Timeout",
@@ -483,15 +513,17 @@ func (m model) wizardView() string {
 	}
 	lines := make([]string, 0, len(m.wizardInputs))
 	for i := range m.wizardInputs {
-		prefix := "  "
+		prefix := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("  ")
+		rowStyle := lipgloss.NewStyle()
 		if i == m.wizardFocus {
-			prefix = "->"
+			prefix = lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Bold(true).Render(">>")
+			rowStyle = rowStyle.Background(lipgloss.Color("238"))
 		}
-		lines = append(lines, fmt.Sprintf("%s %-14s %s", prefix, labels[i]+":", m.wizardInputs[i].View()))
+		lines = append(lines, rowStyle.Render(fmt.Sprintf("%s %s %s", prefix, label.Width(15).Render(labels[i]+":"), m.wizardInputs[i].View())))
 	}
 
 	content := []string{
-		headerStyle.Render("Setup Wizard"),
+		headerStyle.Render("Setup Wizard") + " " + statusChip("EDIT MODE", lipgloss.Color("230"), lipgloss.Color("62")),
 		muted.Render("Config file: " + m.configPath),
 		"",
 		strings.Join(lines, "\n"),
@@ -505,27 +537,36 @@ func (m model) wizardView() string {
 }
 
 func (m model) runningView() string {
-	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("45"))
-	okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("27")).Padding(0, 1)
+	okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("50"))
 	warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	card := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	card := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("33")).
+		Background(lipgloss.Color("236")).
+		Padding(0, 1)
+	albumCardStyle := card.Copy().BorderForeground(lipgloss.Color("44"))
+	statsCardStyle := card.Copy().BorderForeground(lipgloss.Color("99"))
+	eventsCardStyle := card.Copy().BorderForeground(lipgloss.Color("172"))
+	label := lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)
 
 	status := "RUNNING"
-	statusStyle := okStyle
+	statusChipView := statusChip(status, lipgloss.Color("230"), lipgloss.Color("35"))
 	if m.finished && m.err == nil {
 		status = "DONE"
+		statusChipView = statusChip(status, lipgloss.Color("230"), lipgloss.Color("28"))
 	}
 	if m.err != nil {
 		status = "ERROR"
-		statusStyle = errStyle
+		statusChipView = statusChip(status, lipgloss.Color("230"), lipgloss.Color("160"))
 	} else if m.globalFailed > 0 || m.globalMovedFail > 0 {
-		statusStyle = warnStyle
+		statusChipView = statusChip("WARN", lipgloss.Color("232"), lipgloss.Color("220"))
 	}
 
 	elapsed := time.Since(m.start).Round(time.Second)
-	title := headerStyle.Render("Immich Uploader TUI") + "  " + statusStyle.Render(status)
+	title := headerStyle.Render("Immich Uploader TUI") + "  " + statusChipView
 	meta := muted.Render(fmt.Sprintf("elapsed %s | press q to quit | v toggle events", elapsed))
 
 	pFiles := ratio(m.albumDone, m.albumFiles)
@@ -534,29 +575,50 @@ func (m model) runningView() string {
 	if m.albumStart.IsZero() {
 		albumElapsed = 0
 	}
-	albumCard := card.Render(strings.Join([]string{
-		fmt.Sprintf("Album %d/%d: %s", m.albumIndex, m.albumTotal, m.albumName),
-		fmt.Sprintf("Files: %d/%d %s", m.albumDone, m.albumFiles, bar(26, pFiles)),
-		fmt.Sprintf("Bytes: %s / %s %s", formatBytes(m.albumBytes), formatBytes(m.albumTotalBytes), bar(26, pBytes)),
-		fmt.Sprintf("Album speed: %s", formatMBps(m.albumBytes, albumElapsed)),
-		"Last: " + m.lastEvent,
+	albumCard := albumCardStyle.Render(strings.Join([]string{
+		label.Render(fmt.Sprintf("Album %d/%d", m.albumIndex, m.albumTotal)) + " " + lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Render(m.albumName),
+		fmt.Sprintf("%s %d/%d %s", label.Render("Files:"), m.albumDone, m.albumFiles, colorBar(26, pFiles, lipgloss.Color("44"), lipgloss.Color("238"))),
+		fmt.Sprintf("%s %s / %s %s", label.Render("Bytes:"), formatBytes(m.albumBytes), formatBytes(m.albumTotalBytes), colorBar(26, pBytes, lipgloss.Color("50"), lipgloss.Color("238"))),
+		fmt.Sprintf("%s %s", label.Render("Album speed:"), okStyle.Render(formatMBps(m.albumBytes, albumElapsed))),
+		fmt.Sprintf("%s %s", label.Render("Last:"), lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Render(m.lastEvent)),
 	}, "\n"))
 
-	stats := []string{
-		fmt.Sprintf("uploaded %d", m.globalFiles),
-		fmt.Sprintf("duplicates %d", m.globalDup),
-		fmt.Sprintf("failed %d", m.globalFailed),
-		fmt.Sprintf("move-failed %d", m.globalMovedFail),
-		fmt.Sprintf("bytes %s", formatBytes(m.globalBytes)),
-		fmt.Sprintf("global speed %s", formatMBps(m.globalBytes, elapsed)),
+	failColor := lipgloss.Color("50")
+	if m.globalFailed > 0 || m.globalMovedFail > 0 {
+		failColor = lipgloss.Color("196")
 	}
-	statsCard := card.Render("Global\n" + strings.Join(stats, "\n"))
+	dupColor := lipgloss.Color("39")
+	if m.globalDup > 0 {
+		dupColor = lipgloss.Color("220")
+	}
+	stats := []string{
+		fmt.Sprintf("%s %s", label.Render("uploaded"), lipgloss.NewStyle().Foreground(lipgloss.Color("50")).Render(fmt.Sprintf("%d", m.globalFiles))),
+		fmt.Sprintf("%s %s", label.Render("duplicates"), lipgloss.NewStyle().Foreground(dupColor).Render(fmt.Sprintf("%d", m.globalDup))),
+		fmt.Sprintf("%s %s", label.Render("failed"), lipgloss.NewStyle().Foreground(failColor).Render(fmt.Sprintf("%d", m.globalFailed))),
+		fmt.Sprintf("%s %s", label.Render("move-failed"), lipgloss.NewStyle().Foreground(failColor).Render(fmt.Sprintf("%d", m.globalMovedFail))),
+		fmt.Sprintf("%s %s", label.Render("bytes"), lipgloss.NewStyle().Foreground(lipgloss.Color("87")).Render(formatBytes(m.globalBytes))),
+		fmt.Sprintf("%s %s", label.Render("global speed"), okStyle.Render(formatMBps(m.globalBytes, elapsed))),
+	}
+	statsCard := statsCardStyle.Render(label.Render("Global") + "\n" + strings.Join(stats, "\n"))
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, albumCard, "  ", statsCard)
 	out := []string{title, meta, "", body}
 
 	if m.verbose {
-		out = append(out, "", card.Render("Recent Events\n"+strings.Join(m.recent, "\n")))
+		evLines := make([]string, 0, len(m.recent))
+		for _, line := range m.recent {
+			style := lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+			ll := strings.ToLower(line)
+			if strings.Contains(ll, "failed") || strings.Contains(ll, "error") {
+				style = errStyle
+			} else if strings.Contains(ll, "uploaded") || strings.Contains(ll, "completed") {
+				style = okStyle
+			} else if strings.Contains(ll, "duplicate") || strings.Contains(ll, "skipped") {
+				style = warnStyle
+			}
+			evLines = append(evLines, style.Render(line))
+		}
+		out = append(out, "", eventsCardStyle.Render(label.Render("Recent Events")+"\n"+strings.Join(evLines, "\n")))
 	}
 
 	if m.finished {
