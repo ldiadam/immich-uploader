@@ -26,6 +26,11 @@ import (
 
 type uploaderEventMsg struct{ ev uploader.Event }
 type uploaderDoneMsg struct{ err error }
+type preflightLoadedMsg struct {
+	id   int
+	plan uploader.UploadPlan
+	err  error
+}
 type tickMsg time.Time
 
 type uiMode string
@@ -119,6 +124,7 @@ func argValue(name, fallback string) string {
 type keyMap struct {
 	Start      key.Binding
 	Wizard     key.Binding
+	Refresh    key.Binding
 	Quit       key.Binding
 	ToggleLog  key.Binding
 	ToggleHelp key.Binding
@@ -134,6 +140,7 @@ func newKeyMap() keyMap {
 	return keyMap{
 		Start:      key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "start")),
 		Wizard:     key.NewBinding(key.WithKeys("w"), key.WithHelp("w", "wizard")),
+		Refresh:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh plan")),
 		Quit:       key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 		ToggleLog:  key.NewBinding(key.WithKeys("v"), key.WithHelp("v", "toggle logs")),
 		ToggleHelp: key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
@@ -147,12 +154,12 @@ func newKeyMap() keyMap {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Start, k.Wizard, k.ToggleLog, k.ToggleHelp, k.Quit}
+	return []key.Binding{k.Start, k.Wizard, k.Refresh, k.ToggleHelp, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Start, k.Wizard, k.ToggleLog, k.ToggleHelp, k.Quit},
+		{k.Start, k.Wizard, k.Refresh, k.ToggleLog, k.ToggleHelp, k.Quit},
 		{k.Up, k.Down, k.PgUp, k.PgDown, k.Top, k.Bottom},
 	}
 }
@@ -174,8 +181,13 @@ type model struct {
 	keys     keyMap
 	help     help.Model
 
-	configPath string
-	cfg        appConfig
+	configPath  string
+	cfg         appConfig
+	planReqID   int
+	plan        uploader.UploadPlan
+	planLoaded  bool
+	planLoading bool
+	planErr     string
 
 	wizardInputs []textinput.Model
 	wizardFocus  int
@@ -228,8 +240,20 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
+func loadPreflightCmd(id int, cfg appConfig) tea.Cmd {
+	return func() tea.Msg {
+		opt := buildOptions(cfg, nil)
+		opt.Timeout = 20 * time.Second
+		plan, err := uploader.BuildUploadPlan(context.Background(), opt)
+		return preflightLoadedMsg{id: id, plan: plan, err: err}
+	}
+}
+
 func (m model) Init() tea.Cmd {
 	cmds := []tea.Cmd{m.spinner.Tick}
+	if m.mode == modeReady && m.planLoading {
+		cmds = append(cmds, loadPreflightCmd(m.planReqID, m.cfg))
+	}
 	if m.running {
 		cmds = append(cmds, listenEvent(m.events), waitDone(m.done), tickCmd())
 	}
@@ -360,6 +384,13 @@ func (m model) startRunFromConfig() (model, tea.Cmd) {
 	return m.startRunWithConfig(m.cfg)
 }
 
+func (m model) startPreflightLoad() (model, tea.Cmd) {
+	m.planReqID++
+	m.planLoading = true
+	m.planErr = ""
+	return m, loadPreflightCmd(m.planReqID, m.cfg)
+}
+
 func (m model) appendEvent(line string) model {
 	m.eventLines = append(m.eventLines, line)
 	if len(m.eventLines) > 600 {
@@ -458,6 +489,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			case key.Matches(msg, m.keys.Start):
 				return m.startRunFromConfig()
+			case key.Matches(msg, m.keys.Refresh):
+				return m.startPreflightLoad()
 			case key.Matches(msg, m.keys.Wizard):
 				m.mode = modeWizard
 				m.wizardInputs = buildWizardInputs(m.cfg)
@@ -489,7 +522,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case key.Matches(msg, m.keys.Start):
 				if m.finished {
 					m.mode = modeReady
-					return m, nil
+					return m.startPreflightLoad()
 				}
 			}
 
@@ -580,6 +613,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m = m.appendEvent("error | " + msg.err.Error())
 		} else {
 			m.lastEvent = "Upload finished"
+		}
+	case preflightLoadedMsg:
+		if msg.id != m.planReqID {
+			return m, nil
+		}
+		m.plan = msg.plan
+		m.planLoaded = true
+		m.planLoading = false
+		if msg.err != nil {
+			m.planErr = msg.err.Error()
+		} else {
+			m.planErr = ""
 		}
 	}
 
@@ -700,9 +745,24 @@ func (m model) readyView() string {
 	label := lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)
 	value := lipgloss.NewStyle().Foreground(lipgloss.Color("229"))
 	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	warn := lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
 	startBtn := statusChip(" [S] Start Upload ", lipgloss.Color("230"), lipgloss.Color("35"))
 	wizardBtn := statusChip(" [W] Open Wizard ", lipgloss.Color("230"), lipgloss.Color("62"))
+	refreshBtn := statusChip(" [R] Refresh Plan ", lipgloss.Color("230"), lipgloss.Color("69"))
 	quitBtn := statusChip(" [Q] Quit ", lipgloss.Color("230"), lipgloss.Color("160"))
+
+	planStatus := muted.Render("Plan not loaded yet")
+	if m.planLoading {
+		planStatus = muted.Render(m.spinner.View() + " calculating upload plan...")
+	} else if m.planLoaded {
+		planStatus = muted.Render("Upload plan is ready")
+	}
+
+	createCount := "unknown"
+	if m.plan.ServerChecked {
+		createCount = strconv.Itoa(m.plan.AlbumsToCreate)
+	}
 
 	lines := []string{
 		header.Render("Immich Uploader TUI"),
@@ -712,9 +772,18 @@ func (m model) readyView() string {
 		fmt.Sprintf("%s %s", label.Render("Workers:"), value.Render(strconv.Itoa(m.cfg.Workers))),
 		fmt.Sprintf("%s %s", label.Render("Delete On Success:"), value.Render(fmt.Sprintf("%t", m.cfg.DeleteOnSuccess))),
 		"",
-		startBtn + "  " + wizardBtn + "  " + quitBtn,
+		fmt.Sprintf("%s %s", label.Render("Plan Albums:"), value.Render(strconv.Itoa(m.plan.AlbumsTotal))),
+		fmt.Sprintf("%s %s", label.Render("Plan Files:"), value.Render(strconv.Itoa(m.plan.MediaFiles))),
+		fmt.Sprintf("%s %s", label.Render("Plan Size:"), value.Render(formatBytes(m.plan.TotalBytes))),
+		fmt.Sprintf("%s %s", label.Render("Will Create:"), value.Render(createCount)),
+		planStatus,
 		"",
-		hint.Render("Press S to start with current config, or W to edit settings."),
+		startBtn + "  " + wizardBtn + "  " + refreshBtn + "  " + quitBtn,
+		"",
+		hint.Render("Press S to start with current config, W to edit settings, or R to recalculate plan."),
+	}
+	if m.planErr != "" {
+		lines = append(lines, warn.Render("Plan warning: "+m.planErr))
 	}
 	return card.Render(strings.Join(lines, "\n")) + "\n"
 }
@@ -956,6 +1025,8 @@ func main() {
 		help:         help.New(),
 		configPath:   *configPath,
 		cfg:          cfg,
+		planReqID:    1,
+		planLoading:  true,
 		wizardInputs: buildWizardInputs(cfg),
 		spinner:      spin,
 		fileProg:     fileProg,

@@ -41,11 +41,12 @@ This script:
 
 ## Startup flow
 - First run (or `--wizard`) opens setup wizard.
-- After config exists, app opens a ready screen (no auto-upload).
+- After config exists, app opens a ready screen (no auto-upload) and calculates a pre-upload plan (albums/files/total size + estimated albums to create).
 
 Ready screen keys:
 - `s`: start upload
 - `w`: open wizard
+- `r`: refresh upload plan
 - `q`: quit
 
 Wizard keys:
@@ -70,6 +71,7 @@ Running keys:
 - `--workers`: parallel upload workers per album
 - `--batch`: assets per album-add request
 - `--checksum`: send SHA1 checksum header on upload
+- `--dedupe-add`: pre-check duplicates via Immich and add existing assets to album without re-upload
 - `--delete-on-success`: verify uploaded checksum via API, then permanently delete local file
 - `--ignore-dir`: folder name to skip and move successful files into (when not deleting)
 
@@ -77,11 +79,13 @@ Running keys:
 - Uses file `mtime` for both `fileCreatedAt` and `fileModifiedAt`.
 - Filters to common photo/video extensions.
 - If `--delete-on-success=true`, file is deleted only when local SHA1 matches asset checksum returned by Immich.
+- If `--dedupe-add=true`, uploader uses preflight duplicate check and skips uploading files that already exist on server.
 - Empty directories are pruned after move/delete.
 
 ## API endpoints used
 - `GET /albums`
 - `POST /albums`
 - `POST /assets`
+- `POST /assets/bulk-upload-check` (duplicate pre-check)
 - `GET /assets/{id}` (checksum verification for delete mode)
 - `PUT /albums/{id}/assets`

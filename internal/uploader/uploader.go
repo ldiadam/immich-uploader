@@ -54,6 +54,27 @@ type bulkIDs struct {
 	IDs []string `json:"ids"`
 }
 
+type bulkUploadCheckItem struct {
+	ID       string `json:"id"`
+	Checksum string `json:"checksum"`
+}
+
+type bulkUploadCheckRequest struct {
+	Assets []bulkUploadCheckItem `json:"assets"`
+}
+
+type bulkUploadCheckResult struct {
+	Action    string `json:"action"`
+	AssetID   string `json:"assetId"`
+	ID        string `json:"id"`
+	Reason    string `json:"reason"`
+	IsTrashed bool   `json:"isTrashed"`
+}
+
+type bulkUploadCheckResponse struct {
+	Results []bulkUploadCheckResult `json:"results"`
+}
+
 type client struct {
 	baseURL string
 	apiKey  string
@@ -134,6 +155,21 @@ func (c *client) getAssetInfo(ctx context.Context, assetID string) (assetInfoRes
 		return assetInfoResponse{}, err
 	}
 	return out, nil
+}
+
+func (c *client) checkBulkUpload(ctx context.Context, items []bulkUploadCheckItem) (map[string]bulkUploadCheckResult, error) {
+	if len(items) == 0 {
+		return map[string]bulkUploadCheckResult{}, nil
+	}
+	var out bulkUploadCheckResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/assets/bulk-upload-check", bulkUploadCheckRequest{Assets: items}, &out); err != nil {
+		return nil, err
+	}
+	res := make(map[string]bulkUploadCheckResult, len(out.Results))
+	for _, r := range out.Results {
+		res[r.ID] = r
+	}
+	return res, nil
 }
 
 func (c *client) uploadAsset(ctx context.Context, filePath, deviceID, deviceAssetID string, createdAt, modifiedAt time.Time, checksumSHA1 string) (assetUploadResponse, error) {
@@ -370,6 +406,36 @@ func pruneEmptyDirs(startDir, stopDir string) {
 		}
 		cur = next
 	}
+}
+
+func applyLocalSuccessAction(ctx context.Context, c *client, opt Options, folderName, folderPath, filePath, localSHA1Hex, assetID string) error {
+	if opt.DeleteOnSuccess {
+		if localSHA1Hex == "" {
+			return fmt.Errorf("delete skipped: local checksum unavailable")
+		}
+		assetInfo, gerr := c.getAssetInfo(ctx, assetID)
+		if gerr != nil {
+			return fmt.Errorf("delete skipped: fetch uploaded asset failed: %w", gerr)
+		}
+		localB64, berr := hexSHA1ToBase64(localSHA1Hex)
+		if berr != nil {
+			return fmt.Errorf("delete skipped: local checksum conversion failed: %w", berr)
+		}
+		if assetInfo.Checksum != localB64 {
+			return fmt.Errorf("delete skipped: checksum mismatch (local=%s remote=%s)", localB64, assetInfo.Checksum)
+		}
+		if err := os.Remove(filePath); err != nil {
+			return err
+		}
+		pruneEmptyDirs(filepath.Dir(filePath), folderPath)
+		return nil
+	}
+
+	if err := moveFileToIgnore(opt.Root, opt.IgnoreDir, folderName, folderPath, filePath); err != nil {
+		return err
+	}
+	pruneEmptyDirs(filepath.Dir(filePath), folderPath)
+	return nil
 }
 
 func formatBytes(n int64) string {
@@ -864,19 +930,138 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 		uploadedIDs := make([]string, 0, len(files))
 		uploadErrors := 0
 
+		type filePlan struct {
+			idx           int
+			path          string
+			size          int64
+			deviceAssetID string
+			checksumHex   string
+		}
 		type uploadJob struct {
-			idx  int
-			path string
-			size int64
+			plan filePlan
 		}
 		type uploadResult struct {
-			idx     int
-			path    string
-			size    int64
+			plan    filePlan
 			asset   assetUploadResponse
 			dur     time.Duration
 			moveErr error
 			err     error
+		}
+
+		needChecksum := opt.Checksum || opt.DeleteOnSuccess || opt.DedupeAdd
+		plans := make([]filePlan, 0, len(files))
+		for i, fp := range files {
+			st, err := os.Stat(fp)
+			if err != nil {
+				uploadErrors++
+				globalFailed++
+				eventf("stat failed (%s): %v\n", fp, err)
+				continue
+			}
+			rel, _ := filepath.Rel(opt.Root, fp)
+			p := filePlan{
+				idx:           i,
+				path:          fp,
+				size:          st.Size(),
+				deviceAssetID: sha1HexString(rel),
+			}
+			if needChecksum {
+				if sum, err := sha1File(fp); err == nil {
+					p.checksumHex = sum
+				}
+			}
+			plans = append(plans, p)
+		}
+
+		uploadPlans := make([]filePlan, 0, len(plans))
+		completed := 0
+		if opt.DedupeAdd {
+			checkItems := make([]bulkUploadCheckItem, 0, len(plans))
+			for _, p := range plans {
+				if p.checksumHex != "" {
+					checkItems = append(checkItems, bulkUploadCheckItem{ID: p.deviceAssetID, Checksum: p.checksumHex})
+				}
+			}
+			checkRes, err := c.checkBulkUpload(ctx, checkItems)
+			if err != nil {
+				eventf("bulk-upload-check failed for album %s: %v (falling back to upload)\n", folderName, err)
+				uploadPlans = append(uploadPlans, plans...)
+			} else {
+				dupCount := 0
+				for _, p := range plans {
+					r, ok := checkRes[p.deviceAssetID]
+					if ok && strings.EqualFold(r.Action, "reject") && strings.EqualFold(r.Reason, "duplicate") && r.AssetID != "" {
+						dupCount++
+						completed++
+						processedBytes += p.size
+						uploadedIDs = append(uploadedIDs, r.AssetID)
+						globalFiles++
+						globalDup++
+
+						if merr := applyLocalSuccessAction(ctx, c, opt, folderName, folderPath, p.path, p.checksumHex, r.AssetID); merr != nil {
+							globalMovedFail++
+							eventf("post-success action failed (%s): %v\n", p.path, merr)
+							emit(Event{
+								Kind:            EventMoveFailed,
+								AlbumName:       folderName,
+								AlbumIndex:      tui.globalAlbums + 1,
+								AlbumTotal:      totalAlbums,
+								AlbumDone:       completed,
+								AlbumFileCount:  len(files),
+								AlbumBytes:      processedBytes,
+								AlbumTotalBytes: totalBytes,
+								FilePath:        p.path,
+								FileName:        filepath.Base(p.path),
+								Error:           merr.Error(),
+								GlobalFiles:     globalFiles,
+								GlobalDup:       globalDup,
+								GlobalFailed:    globalFailed,
+								GlobalMovedFail: globalMovedFail,
+								GlobalBytes:     globalBytes,
+							})
+						}
+
+						emit(Event{
+							Kind:            EventFileUploaded,
+							AlbumName:       folderName,
+							AlbumIndex:      tui.globalAlbums + 1,
+							AlbumTotal:      totalAlbums,
+							AlbumDone:       completed,
+							AlbumFileCount:  len(files),
+							AlbumBytes:      processedBytes,
+							AlbumTotalBytes: totalBytes,
+							FilePath:        p.path,
+							FileName:        filepath.Base(p.path),
+							AssetID:         r.AssetID,
+							AssetStatus:     "duplicate-precheck",
+							GlobalFiles:     globalFiles,
+							GlobalDup:       globalDup,
+							GlobalFailed:    globalFailed,
+							GlobalMovedFail: globalMovedFail,
+							GlobalBytes:     globalBytes,
+						})
+
+						if tuiEnabled {
+							tui.Lock()
+							tui.globalFiles = globalFiles
+							tui.globalDup = globalDup
+							tui.globalMovedFail = globalMovedFail
+							tui.albumDone = completed
+							tui.albumBytes = processedBytes
+							tui.albumLast = filepath.Base(p.path) + " (duplicate-precheck)"
+							tui.Unlock()
+							clearAndPrint(renderLine())
+						}
+					} else {
+						uploadPlans = append(uploadPlans, p)
+					}
+				}
+				if dupCount > 0 {
+					eventf("Album %s: %d duplicates reused via precheck\n", folderName, dupCount)
+				}
+			}
+		} else {
+			uploadPlans = append(uploadPlans, plans...)
 		}
 
 		jobs := make(chan uploadJob)
@@ -887,104 +1072,63 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 		if workerCount < 1 {
 			workerCount = 1
 		}
-		if workerCount > len(files) {
-			workerCount = len(files)
+		if workerCount > len(uploadPlans) {
+			workerCount = len(uploadPlans)
 		}
 
-		for w := 0; w < workerCount; w++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for job := range jobs {
-					st, err := os.Stat(job.path)
-					if err != nil {
-						results <- uploadResult{idx: job.idx, path: job.path, size: job.size, err: err}
-						continue
-					}
+		if len(uploadPlans) > 0 {
+			for w := 0; w < workerCount; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for job := range jobs {
+						st, err := os.Stat(job.plan.path)
+						if err != nil {
+							results <- uploadResult{plan: job.plan, err: err}
+							continue
+						}
 
-					rel, _ := filepath.Rel(opt.Root, job.path)
-					deviceAssetID := sha1HexString(rel)
-					created := st.ModTime()
-					modified := st.ModTime()
+						created := st.ModTime()
+						modified := st.ModTime()
+						sum := ""
+						if opt.Checksum {
+							sum = job.plan.checksumHex
+						}
 
-					sum := ""
-					localSHA1Hex := ""
-					if opt.Checksum || opt.DeleteOnSuccess {
-						s, err := sha1File(job.path)
+						fileStart := time.Now()
+						asset, err := c.uploadAsset(ctx, job.plan.path, deviceID, job.plan.deviceAssetID, created, modified, sum)
+						fileDur := time.Since(fileStart)
+						var moveErr error
 						if err == nil {
-							localSHA1Hex = s
-							if opt.Checksum {
-								sum = s
-							}
-						}
-					}
-
-					fileStart := time.Now()
-					asset, err := c.uploadAsset(ctx, job.path, deviceID, deviceAssetID, created, modified, sum)
-					fileDur := time.Since(fileStart)
-					var moveErr error
-					if err == nil {
-						if opt.DeleteOnSuccess {
-							if localSHA1Hex == "" {
-								moveErr = fmt.Errorf("delete skipped: local checksum unavailable")
-							} else {
-								assetInfo, gerr := c.getAssetInfo(ctx, asset.ID)
-								if gerr != nil {
-									moveErr = fmt.Errorf("delete skipped: fetch uploaded asset failed: %w", gerr)
-								} else {
-									localB64, berr := hexSHA1ToBase64(localSHA1Hex)
-									if berr != nil {
-										moveErr = fmt.Errorf("delete skipped: local checksum conversion failed: %w", berr)
-									} else if assetInfo.Checksum != localB64 {
-										moveErr = fmt.Errorf("delete skipped: checksum mismatch (local=%s remote=%s)", localB64, assetInfo.Checksum)
-									} else if derr := os.Remove(job.path); derr != nil {
-										moveErr = derr
-									} else {
-										// Best effort: remove now-empty source directories up to album root.
-										pruneEmptyDirs(filepath.Dir(job.path), folderPath)
-									}
-								}
-							}
+							moveErr = applyLocalSuccessAction(ctx, c, opt, folderName, folderPath, job.plan.path, job.plan.checksumHex, asset.ID)
 							if moveErr != nil {
-								eventf("delete failed (%s): %v\n", job.path, moveErr)
-							}
-						} else {
-							if merr := moveFileToIgnore(opt.Root, opt.IgnoreDir, folderName, folderPath, job.path); merr != nil {
-								eventf("move failed (%s): %v\n", job.path, merr)
-								moveErr = merr
-							} else {
-								// Best effort: remove now-empty source directories up to album root.
-								pruneEmptyDirs(filepath.Dir(job.path), folderPath)
+								eventf("post-success action failed (%s): %v\n", job.plan.path, moveErr)
 							}
 						}
+						results <- uploadResult{plan: job.plan, asset: asset, dur: fileDur, moveErr: moveErr, err: err}
 					}
-					results <- uploadResult{idx: job.idx, path: job.path, size: job.size, asset: asset, dur: fileDur, moveErr: moveErr, err: err}
+				}()
+			}
+
+			go func() {
+				for _, p := range uploadPlans {
+					jobs <- uploadJob{plan: p}
 				}
+				close(jobs)
+				wg.Wait()
+				close(results)
 			}()
+		} else {
+			close(results)
 		}
 
-		go func() {
-			for i, fp := range files {
-				st, err := os.Stat(fp)
-				if err != nil {
-					results <- uploadResult{idx: i, path: fp, size: 0, err: err}
-					continue
-				}
-				jobs <- uploadJob{idx: i, path: fp, size: st.Size()}
-			}
-			close(jobs)
-			wg.Wait()
-			close(results)
-		}()
-
-		completed := 0
 		for res := range results {
 			completed++
-			processedBytes += res.size
+			processedBytes += res.plan.size
 			if res.err != nil {
 				uploadErrors++
 				globalFailed++
-				eventf("upload failed (%s): %v\n", res.path, res.err)
+				eventf("upload failed (%s): %v\n", res.plan.path, res.err)
 				emit(Event{
 					Kind:            EventFileFailed,
 					AlbumName:       folderName,
@@ -994,8 +1138,8 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 					AlbumFileCount:  len(files),
 					AlbumBytes:      processedBytes,
 					AlbumTotalBytes: totalBytes,
-					FilePath:        res.path,
-					FileName:        filepath.Base(res.path),
+					FilePath:        res.plan.path,
+					FileName:        filepath.Base(res.plan.path),
 					Error:           res.err.Error(),
 					GlobalFiles:     globalFiles,
 					GlobalDup:       globalDup,
@@ -1008,7 +1152,7 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 					tui.globalFailed = globalFailed
 					tui.albumDone = completed
 					tui.albumBytes = processedBytes
-					tui.albumLast = filepath.Base(res.path) + " (error)"
+					tui.albumLast = filepath.Base(res.plan.path) + " (error)"
 					tui.Unlock()
 					clearAndPrint(renderLine())
 				}
@@ -1019,7 +1163,7 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 			if strings.Contains(strings.ToLower(res.asset.Status), "duplicate") {
 				globalDup++
 			}
-			globalBytes += res.size
+			globalBytes += res.plan.size
 			if res.moveErr != nil {
 				globalMovedFail++
 				emit(Event{
@@ -1031,8 +1175,8 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 					AlbumFileCount:  len(files),
 					AlbumBytes:      processedBytes,
 					AlbumTotalBytes: totalBytes,
-					FilePath:        res.path,
-					FileName:        filepath.Base(res.path),
+					FilePath:        res.plan.path,
+					FileName:        filepath.Base(res.plan.path),
 					Error:           res.moveErr.Error(),
 					GlobalFiles:     globalFiles,
 					GlobalDup:       globalDup,
@@ -1050,8 +1194,8 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 				AlbumFileCount:  len(files),
 				AlbumBytes:      processedBytes,
 				AlbumTotalBytes: totalBytes,
-				FilePath:        res.path,
-				FileName:        filepath.Base(res.path),
+				FilePath:        res.plan.path,
+				FileName:        filepath.Base(res.plan.path),
 				AssetID:         res.asset.ID,
 				AssetStatus:     res.asset.Status,
 				GlobalFiles:     globalFiles,
@@ -1065,7 +1209,7 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 				tui.globalFiles = globalFiles
 				tui.globalDup = globalDup
 				tui.globalMovedFail = globalMovedFail
-				tui.albumLast = filepath.Base(res.path) + " (" + res.asset.Status + ")"
+				tui.albumLast = filepath.Base(res.plan.path) + " (" + res.asset.Status + ")"
 				tui.Unlock()
 			}
 
@@ -1079,11 +1223,11 @@ func Run(ctx context.Context, opt Options, logf Logf) error {
 				clearAndPrint(renderLine())
 			} else {
 				logf("    Progress: %d/%d (%s/%s) | avg %s | last %s (%s)\n",
-					completed, len(files), formatBytes(processedBytes), formatBytes(totalBytes), formatRate(processedBytes, elapsed), formatRate(res.size, res.dur), res.dur.Round(time.Millisecond))
+					completed, len(files), formatBytes(processedBytes), formatBytes(totalBytes), formatRate(processedBytes, elapsed), formatRate(res.plan.size, res.dur), res.dur.Round(time.Millisecond))
 			}
 
 			if !tuiEnabled {
-				logf("  [%d/%d] %s -> %s (%s)\n", completed, len(files), filepath.Base(res.path), res.asset.ID, res.asset.Status)
+				logf("  [%d/%d] %s -> %s (%s)\n", completed, len(files), filepath.Base(res.plan.path), res.asset.ID, res.asset.Status)
 			}
 		}
 
