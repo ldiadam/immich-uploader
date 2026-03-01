@@ -3,7 +3,7 @@ set -euo pipefail
 
 INSTALL_DIR="${HOME}/.local/bin"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TUI_SRC="${ROOT_DIR}/immich-uploader-tui"
+TUI_SRC="${ROOT_DIR}/immich-uploader-linux-amd64"
 COPY_BINS=1
 
 usage() {
