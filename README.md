@@ -30,6 +30,29 @@ This script:
 - adds it to shell startup files,
 - installs `immich-uploader` and `immich-uploader-tui` from the built TUI binary.
 
+## Windows install
+
+Build the Windows GUI binary:
+
+```powershell
+go build -o immich-uploader-windows-amd64.exe ./cmd/gui
+```
+
+Then install it and register Explorer folder actions:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+```
+
+If you prefer a double-clickable installer, run `scripts\install-windows.cmd` instead.
+
+This script:
+- copies the Windows GUI binary into `%LOCALAPPDATA%\Programs\immich-uploader`,
+- registers folder and folder-background context-menu entries in Windows Explorer,
+- launches the app with the selected folder as `--root` and enables `--autostart`.
+
+Windows shell integration is added as a right-click Explorer menu item, not as a replacement for normal left-click folder behavior.
+
 ## Run
 
 ```bash

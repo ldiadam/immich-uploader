@@ -5,9 +5,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,9 +60,9 @@ func configPath() string {
 	return filepath.Join(dir, "immich-uploader", "config.json")
 }
 
-func loadConfig() Config {
+func loadConfig(path string) Config {
 	cfg := defaultConfig()
-	b, err := os.ReadFile(configPath())
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return cfg
 	}
@@ -68,8 +70,8 @@ func loadConfig() Config {
 	return cfg
 }
 
-func saveConfig(cfg Config) error {
-	p := configPath()
+func saveConfig(path string, cfg Config) error {
+	p := path
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
@@ -78,11 +80,24 @@ func saveConfig(cfg Config) error {
 }
 
 func main() {
+	defaultPath := configPath()
+	configFile := flag.String("config", defaultPath, "Config file path")
+	rootOverride := flag.String("root", "", "Override root folder, useful for Explorer integration")
+	autoStart := flag.Bool("autostart", false, "Start upload after the window opens")
+	flag.Parse()
+
+	if *rootOverride == "" && len(flag.Args()) > 0 {
+		*rootOverride = flag.Args()[0]
+	}
+
 	a := app.New()
 	w := a.NewWindow("Immich Uploader")
 	w.Resize(fyne.NewSize(860, 620))
 
-	cfg := loadConfig()
+	cfg := loadConfig(*configFile)
+	if strings.TrimSpace(*rootOverride) != "" {
+		cfg.Root = strings.TrimSpace(*rootOverride)
+	}
 
 	baseURLEntry := widget.NewEntry()
 	baseURLEntry.SetText(cfg.BaseURL)
@@ -140,7 +155,7 @@ func main() {
 	running := false
 
 	var startBtn *widget.Button
-	startBtn = widget.NewButton("Start upload", func() {
+	startUpload := func() {
 		runningMu.Lock()
 		if running {
 			runningMu.Unlock()
@@ -165,7 +180,7 @@ func main() {
 			cfg.Timeout = d
 		}
 
-		_ = saveConfig(cfg)
+		_ = saveConfig(*configFile, cfg)
 
 		logBox.Enable()
 		logBox.SetText("")
@@ -208,7 +223,9 @@ func main() {
 				}
 			})
 		}()
-	})
+	}
+
+	startBtn = widget.NewButton("Start upload", startUpload)
 
 	form := widget.NewForm(
 		widget.NewFormItem("Immich URL", baseURLEntry),
@@ -227,6 +244,17 @@ func main() {
 		nil, nil, nil,
 		scroll,
 	))
+
+	shouldAutoStart := *autoStart &&
+		strings.TrimSpace(cfg.Root) != "" &&
+		strings.TrimSpace(cfg.BaseURL) != "" &&
+		strings.TrimSpace(cfg.APIKey) != ""
+	if shouldAutoStart {
+		go func() {
+			time.Sleep(250 * time.Millisecond)
+			fyne.Do(startUpload)
+		}()
+	}
 
 	w.ShowAndRun()
 }
